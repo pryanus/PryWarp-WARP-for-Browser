@@ -16,17 +16,25 @@
   Мост тихо запустится в фоне и пропишется только в автозагрузку
   текущего пользователя Windows (без прав администратора и без VPN-драйвера).
 
-ШАГ 2 — Добавь расширение в браузер:
-  • Chrome / Яндекс Браузер / Edge / Brave / Opera / Vivaldi:
-    1. Открой  chrome://extensions  (в Яндексе:  browser://extensions)
+ШАГ 2 — Добавь расширение в браузер (выбери папку под свой браузер):
+  • Папка extension-chromium (движок Chromium):
+    Подходит для: Google Chrome, Яндекс Браузер, Microsoft Edge,
+    Opera, Opera GX, Brave, Vivaldi, Atom, Arc.
+    1. Открой  chrome://extensions  (в Яндексе: browser://extensions,
+       в Edge: edge://extensions, в Opera: opera://extensions)
     2. Включи "Режим разработчика" (переключатель вверху)
     3. Нажми "Загрузить распакованное расширение"
     4. Выбери папку:  extension-chromium
+    (В Brave работают обычные вкладки; приватное окно с Tor изолировано.)
 
-  • Firefox / Zen / LibreWolf:
+  • Папка extension-firefox (движок Firefox / Gecko):
+    Подходит для: Mozilla Firefox, Tor Browser, Zen Browser,
+    LibreWolf, Waterfox, Floorp.
     1. Открой  about:debugging#/runtime/this-firefox
     2. Нажми "Загрузить временное дополнение..."
     3. Выбери файл manifest.json внутри папки:  extension-firefox
+    (В Tor Browser работает до перезапуска; для не-WARP сайтов в
+     настройках расширения есть совместимость с цепочкой Tor.)
 
 Закрепи значок PryWarp на панели браузера:
   • Зелёные очки  = WARP активен и мост на связи

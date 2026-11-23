@@ -11,9 +11,13 @@
 **Требование для Windows:** установленный [Python 3.10+](https://www.python.org/downloads/) (при установке поставь галочку *«Add Python to PATH»*, либо в терминале: `winget install Python.Python.3.12`).
 
 1. **Запусти мост:** распакуй архив в любую постоянную папку (например `D:\PryWarp`) и запусти **`УСТАНОВИТЬ_МОСТ.cmd`** — фоновый мост поднимется в `user-space` и добавится в автозагрузку текущего пользователя (`HKCU\...\Run\PryWarpBridge`).
-2. **Подключи расширение в браузере:**
-   - **Chrome / Яндекс Браузер / Edge / Brave / Opera / Vivaldi:** открой `chrome://extensions` (`browser://extensions` в Яндексе), включи **Режим разработчика** → **Загрузить распакованное расширение** → укажи папку **`extension-chromium`**.
-   - **Firefox / Zen / LibreWolf:** открой `about:debugging#/runtime/this-firefox` → **Загрузить временное дополнение** → выбери `manifest.json` внутри папки **`extension-firefox`** (для постоянного режима без перезагрузки — подписанная/Developer Edition сборка).
+2. **Подключи расширение в браузере (выбери папку под свой браузер):**
+   - **Папка `extension-chromium`** — для всех браузеров на движке **Chromium** (**Google Chrome, Яндекс Браузер, Microsoft Edge, Opera / Opera GX, Brave, Vivaldi, Atom, Arc**):
+     - Открой `chrome://extensions` (`browser://extensions` в Яндексе, `edge://extensions` в Edge, `opera://extensions` в Opera, `brave://extensions` в Brave).
+     - Включи **Режим разработчика** → **Загрузить распакованное расширение** → укажи папку **`extension-chromium`**.
+     - *Примечание для Brave:* обычные вкладки работают через WARP, а встроенное «Приватное окно с Tor» изолировано самим браузером.
+   - **Папка `extension-firefox`** — для всех браузеров на движке **Firefox / Gecko** (**Mozilla Firefox, Tor Browser, Zen Browser, LibreWolf, Waterfox, Floorp**):
+     - Открой `about:debugging#/runtime/this-firefox` → **Загрузить временное дополнение** → выбери `manifest.json` внутри папки **`extension-firefox`** (для постоянного режима без перезагрузки нужна подписанная или Developer Edition сборка; в Tor Browser временное дополнение работает до перезапуска, а режим совместимости с Tor в настройках расширения не даёт остальным сайтам уходить мимо цепочки Tor).
 
 Готово! Закрепи иконку **PryWarp** на панели инструментов браузера:
 - **Зелёные очки** — мост запущен, туннель Cloudflare WARP активен для выбранных сайтов.
@@ -30,8 +34,8 @@
 | `ИНСТРУКЦИЯ.txt` | Короткая офлайн-памятка по установке, использованию и удалению |
 | `УСТАНОВИТЬ_МОСТ.cmd` | Запуск локального WARP-моста в фоне + добавление в автозагрузку Windows |
 | `УДАЛИТЬ_МОСТ.cmd` | Остановка моста и полное удаление из автозагрузки (реестр + процесс) |
-| `extension-chromium/` | Папка расширения (MV3) для Chrome, Яндекс, Edge, Brave, Opera, Vivaldi |
-| `extension-firefox/` | Папка расширения (MV3) для Firefox, Zen, LibreWolf, Tor Browser |
+| `extension-chromium/` | Папка расширения (MV3) для движка **Chromium**: Chrome, Яндекс Браузер, Edge, Opera / GX, Brave, Vivaldi, Atom, Arc |
+| `extension-firefox/` | Папка расширения (MV3) для движка **Firefox / Gecko**: Firefox, Tor Browser, Zen, LibreWolf, Waterfox, Floorp |
 | `bridge/` | Фоновый менеджер моста (`warp_bridge.py`, `bridge_ctl.ps1`) и бинарник `usque.exe` |
 
 ---
