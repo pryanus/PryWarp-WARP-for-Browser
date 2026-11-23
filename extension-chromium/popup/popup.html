@@ -1,0 +1,225 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>PryWarp — WARP for Browser</title>
+  <link rel="stylesheet" href="popup.css">
+</head>
+<body>
+  <div class="app">
+    <header class="header">
+      <div class="header-left">
+        <div class="brand-line">
+          <h1 class="app-title">PryWarp</h1>
+          <span class="app-sub">— WARP for Browser</span>
+          <span id="versionBadge" class="version-pill tabular">v1.0.0</span>
+        </div>
+      </div>
+      <div class="header-right">
+        <button id="githubHeaderBtn" class="btn btn-outline btn-header" type="button" title="Открыть репозиторий на GitHub">
+          <span>GitHub</span>
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M7 17L17 7"/>
+            <path d="M7 7h10v10"/>
+          </svg>
+        </button>
+      </div>
+    </header>
+
+    <section class="card status-card" aria-label="Состояние туннеля WARP">
+      <div class="status-top">
+        <div class="status-left">
+          <div class="status-headline">
+            <span id="bridgeDot" class="status-dot dot-unknown" aria-hidden="true"></span>
+            <span id="bridgeStateText" class="card-title">Проверка моста</span>
+          </div>
+          <p id="bridgeMeta" class="meta-line tabular">127.0.0.1:10880</p>
+        </div>
+
+        <div id="statusActions" class="status-actions">
+          <button id="masterToggleBtn" class="btn btn-danger-solid" type="button" aria-pressed="true">Выключить</button>
+          <button id="reconnectBtn" class="btn btn-outline" type="button" title="Переподключить WARP">Сброс</button>
+        </div>
+        <div id="offlineActions" class="status-actions" hidden>
+          <button id="retryBridgeBtn" class="btn btn-primary" type="button">Проверить</button>
+        </div>
+      </div>
+
+      <div id="bridgeOfflineHint" class="offline-box" hidden>
+        <div class="offline-title">Как запустить мост (нужно 1 раз):</div>
+        <ol class="offline-steps">
+          <li>Запусти <span class="mono">УСТАНОВИТЬ_МОСТ.cmd</span> из папки PryWarp</li>
+          <li>Через 2–3 секунды этот экран станет зелёным — нажми «Проверить», если нужно сразу</li>
+        </ol>
+        <div class="offline-sub">Локальный адрес моста: <span id="hintApiAddr" class="mono">127.0.0.1:10881</span></div>
+      </div>
+    </section>
+
+    <nav class="tab-strip" role="tablist" aria-label="Разделы">
+      <button id="tabSites" class="tab-pill active" type="button" role="tab" aria-selected="true" aria-controls="panelSites">
+        Сайты <span id="sitesCount" class="tab-num tabular">(1)</span>
+      </button>
+      <button id="tabSettings" class="tab-pill" type="button" role="tab" aria-selected="false" aria-controls="panelSettings">
+        Настройки
+      </button>
+      <button id="tabUpdates" class="tab-pill" type="button" role="tab" aria-selected="false" aria-controls="panelUpdates">
+        Обновление
+        <span id="updateDot" class="tab-alert-dot" hidden aria-label="Доступно обновление"></span>
+      </button>
+    </nav>
+
+    <main id="panelSites" class="panel" role="tabpanel" aria-labelledby="tabSites">
+      <div class="scroller" id="rulesScroller">
+        <div id="routeModeCard" class="card mode-card">
+          <div class="mode-info">
+            <span id="routeModeTitle" class="mode-title">Только избранные сайты</span>
+            <span id="routeModeDesc" class="field-caption">Через WARP идут YouTube и добавленные сайты</span>
+          </div>
+          <button id="routeAllBtn" class="btn btn-primary btn-compact" type="button" aria-pressed="false">Ко всем сайтам</button>
+        </div>
+
+        <div id="currentSiteCard" class="card current-card" hidden>
+          <div class="current-info">
+            <span class="field-caption">Текущий сайт в браузере</span>
+            <span id="currentDomainText" class="domain-title">—</span>
+          </div>
+          <button id="quickAddCurrentBtn" class="btn btn-primary" type="button">
+            <span id="quickAddLabel">Добавить сайт</span>
+          </button>
+        </div>
+
+        <form id="addDomainForm" class="add-form" novalidate>
+          <div class="input-row">
+            <input
+              id="domainInput"
+              class="input"
+              type="text"
+              placeholder="Домен, например rutracker.org"
+              autocomplete="off"
+              spellcheck="false"
+              aria-label="Домен для обхода"
+            >
+            <button class="btn btn-outline" type="submit">Добавить</button>
+          </div>
+          <p id="domainHint" class="helper-text">Достаточно основного домена — все поддомены подключатся сами</p>
+        </form>
+
+        <div class="card rule-card">
+          <div class="rule-body">
+            <div class="rule-head">
+              <span class="rule-title">YouTube</span>
+              <span id="youtubeStatusBadge" class="state-text state-ok">В обходе</span>
+            </div>
+            <p class="rule-domains">youtube.com · googlevideo.com · ytimg.com · ggpht.com (+3)</p>
+          </div>
+          <button id="youtubeToggleBtn" class="btn btn-outline btn-compact" type="button" aria-pressed="true">Выкл</button>
+        </div>
+
+        <div id="customRulesList" class="rules-list"></div>
+
+        <div id="emptyRulesState" class="empty-box" hidden>
+          Своих сайтов пока нет. Введи домен выше или добавь открытую вкладку в 1 клик
+        </div>
+      </div>
+    </main>
+
+    <section id="panelSettings" class="panel" role="tabpanel" aria-labelledby="tabSettings" hidden>
+      <div class="scroller">
+        <div class="card section-card">
+          <h2 class="section-title">Туннель Cloudflare WARP</h2>
+
+          <div class="field-block">
+            <label class="field-label" for="transportSelect">Протокол подключения</label>
+            <select id="transportSelect" class="input select">
+              <option value="auto">Авто (QUIC → HTTP/2 при сбое)</option>
+              <option value="http2">Только HTTP/2 (TCP 443)</option>
+              <option value="quic">Только QUIC (HTTP/3 UDP)</option>
+            </select>
+          </div>
+
+          <div class="two-col">
+            <div class="field-block">
+              <label class="field-label" for="socksPortInput">Порт SOCKS5</label>
+              <input id="socksPortInput" class="input tabular" type="number" min="1" max="65535" value="10880">
+            </div>
+            <div class="field-block">
+              <label class="field-label" for="apiPortInput">Порт API моста</label>
+              <input id="apiPortInput" class="input tabular" type="number" min="1" max="65535" value="10881">
+            </div>
+          </div>
+
+          <label class="check-row" for="torPassthroughCheckbox">
+            <input id="torPassthroughCheckbox" class="native-check" type="checkbox">
+            <span>Не перебивать прокси браузера для остальных сайтов (Tor)</span>
+          </label>
+        </div>
+
+        <div class="card section-card">
+          <h2 class="section-title">Перенос списка сайтов</h2>
+          <p class="helper-text">Сохрани список в JSON, чтобы перенести его в Chrome, Opera, Firefox или Tor</p>
+          <div class="button-row-3">
+            <button id="saveSettingsBtn" class="btn btn-primary" type="button">Сохранить</button>
+            <button id="exportRulesBtn" class="btn btn-outline" type="button">Экспорт</button>
+            <button id="importRulesBtn" class="btn btn-outline" type="button">Импорт</button>
+            <input id="importFileInput" type="file" accept="application/json" hidden>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section id="panelUpdates" class="panel" role="tabpanel" aria-labelledby="tabUpdates" hidden>
+      <div class="scroller">
+        <div class="card section-card">
+          <h2 class="section-title">Репозиторий GitHub</h2>
+          <div class="field-block">
+            <label class="field-label" for="githubUrlInput">Ссылка на проект</label>
+            <input
+              id="githubUrlInput"
+              class="input"
+              type="url"
+              placeholder="https://github.com/pryanus/PryWarp-WARP-for-Browser"
+              autocomplete="off"
+              spellcheck="false"
+            >
+          </div>
+          <p class="helper-text">Используется для кнопки GitHub в шапке и проверки новых релизов</p>
+          <div class="button-row-2">
+            <button id="saveGithubBtn" class="btn btn-primary" type="button">Сохранить ссылку</button>
+            <a id="openReleaseLink" class="btn btn-outline" href="#" target="_blank" rel="noopener noreferrer" hidden>Открыть релиз</a>
+          </div>
+        </div>
+
+        <div class="card section-card">
+          <h2 class="section-title">Обновление программы</h2>
+          <div class="update-row">
+            <button id="checkUpdatesBtn" class="btn btn-outline" type="button">Проверить сейчас</button>
+            <span id="updateStatusText" class="update-meta">Ещё не проверялось</span>
+          </div>
+
+          <label class="check-row" for="autoUpdateCheckbox">
+            <input id="autoUpdateCheckbox" class="native-check" type="checkbox">
+            <span>Автоматически проверять обновления</span>
+          </label>
+
+          <div class="field-block">
+            <label class="field-label" for="updateIntervalSelect">Интервал автопроверки</label>
+            <select id="updateIntervalSelect" class="input select">
+              <option value="12">Каждые 12 часов</option>
+              <option value="24">Каждые 24 часа</option>
+              <option value="168">Раз в неделю</option>
+            </select>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <footer class="footer">
+      <span id="footerInfo" class="footer-text tabular">PryWarp — WARP for Browser · v1.0.0</span>
+      <span id="toastText" class="toast-text" role="status" aria-live="polite"></span>
+    </footer>
+  </div>
+
+  <script type="module" src="popup.js"></script>
+</body>
+</html>

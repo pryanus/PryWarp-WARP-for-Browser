@@ -1,0 +1,17 @@
+bridge/config.json
+bridge/bridge.log
+bridge/bridge_settings.json
+bridge/usque.exe
+bridge/__pycache__/
+tests/__pycache__/
+.codegraph/
+__pycache__/
+*.pyc
+.DS_Store
+*.zip
+*.xpi
+*.tmp
+build/
+build_payload/
+dist/
+*.spec
