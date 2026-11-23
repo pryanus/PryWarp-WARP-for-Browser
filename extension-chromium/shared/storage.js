@@ -3,7 +3,7 @@
  * Supports Chrome, Yandex, Opera, Edge, Brave, Vivaldi, Firefox, and Tor Browser.
  */
 
-export const APP_VERSION = '1.0.0';
+export const APP_VERSION = '1.0.1';
 export const STORAGE_KEY = 'warpBridgeState';
 
 export const DEFAULT_STATE = Object.freeze({

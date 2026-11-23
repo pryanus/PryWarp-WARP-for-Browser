@@ -22,7 +22,7 @@ ICONS_DIR = SRC / "icons"
 DIST_CHROMIUM = ROOT / "extension-chromium"
 DIST_FIREFOX = ROOT / "extension-firefox"
 
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.0.1"
 
 
 def _png_chunk(tag: bytes, data: bytes) -> bytes:

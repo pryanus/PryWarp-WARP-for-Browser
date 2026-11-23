@@ -46,7 +46,7 @@
 В основе сетевого транспорта лежит open-source клиент Cloudflare WARP по протоколу **MASQUE** — **[Diniboy1123/usque](https://github.com/Diniboy1123/usque)** (в релиз включён оригинальный бинарник `usque v4.2.1` для `windows_amd64`).
 
 - **При первом запуске** `bridge/warp_bridge.py` автоматически регистрирует бесплатный анонимный аккаунт Cloudflare WARP (`usque.exe -c config.json register -a`) и сохраняет локальную конфигурацию с ключами устройства в `bridge/config.json` только на твоём ПК.
-- **Транспорт по умолчанию:** `QUIC` (HTTP/3 поверх UDP, порты/адреса Cloudflare MASQUE `162.159.198.1` / `162.159.198.2`, MTU `1360`, keepalive `15s`, DNS `1.1.1.1` / `1.0.0.1`) с автоматическим переключением на `HTTP/2` (TCP), если провайдер режет UDP/QUIC. В настройках расширения можно принудительно зафиксировать `Auto`, `QUIC` или `HTTP/2`.
+- **Транспорт по умолчанию:** `QUIC` (HTTP/3 поверх UDP, адреса Cloudflare MASQUE `162.159.198.1` / `162.159.198.2`, MTU `1280`, keepalive `15s`, DNS `1.1.1.1` / `1.0.0.1`) с автоматическим переключением на `HTTP/2` (TCP), если провайдер режет UDP/QUIC (и периодической попыткой авто-возврата обратно на быстрый `QUIC`). В настройках расширения можно принудительно зафиксировать `Auto`, `QUIC` или `HTTP/2`.
 
 ### 2. Изоляция `user-space` (без VPN-адаптера и вмешательства в ОС)
 - `usque.exe` работает **строго в user-space** в режиме локального SOCKS5-прокси на **`127.0.0.1:10880`**, а `warp_bridge.py` следит за стабильностью процесса, проверяет фактическую доступность WARP + YouTube (`cloudflare.com/cdn-cgi/trace` + `youtube.com/generate_204`) и отдаёт лёгкий локальный API статуса на **`127.0.0.1:10881`**.
@@ -56,9 +56,23 @@
 
 ### 3. Домены, поддомены и режим «Ко всем сайтам»
 - **1 корневой домен = сайт целиком:** при добавлении, например, `discord.com` автоматически маршрутизируются и корень `discord.com`, и все поддомены `*.discord.com` (CDN, медиа, вебсокеты внутри этого домена).
-- **Пресет YouTube (из коробки):** уже включает все 12 необходимых доменов воспроизведения, картинок, API и скриптов (`youtube.com`, `googlevideo.com`, `ytimg.com`, `ggpht.com`, `youtu.be`, `youtube-nocookie.com`, `youtubei.googleapis.com`, `youtubeembeddedplayer.googleapis.com`, `yt3.ggpht.com`, `yt4.ggpht.com`, `jnn-pa.googleapis.com`, `widevine.l.google.com`).
+- **Пресет YouTube (из коробки):** уже включает все 12 необходимых доменов воспроизведения, картинок, API и скриптов (`youtube.com`, `googlevideo.com`, `ytimg.com`, `ggpht.com`, `youtu.be`, `youtubei.googleapis.com`, `jnn-pa.googleapis.com`, `youtube-nocookie.com`, `yt.be`, `yt3.googleusercontent.com`, `yt4.googleusercontent.com`, `gvt1.com`).
 - **Кнопка «Ко всем сайтам» / «К избранным»:** переключает режим маршрутизации прямо в один клик — либо только твой список доменов, либо **весь внешний трафик браузера** через WARP (локальные адреса `localhost`, `127.0.0.1`, `192.168.*`, `10.*`, `.local` всегда идут напрямую).
 - **Только браузер (важное ограничение):** расширение управляет трафиком **только внутри браузера**. Отдельные настольные клиенты вроде `Discord.exe`, Steam или онлайн-игр работают мимо прокси браузера и затронуты не будут (веб-версия Discord в браузере заработает при добавлении доменов Discord или в режиме «Ко всем сайтам»).
+
+### 4. Совместимость с `zapret-discord-youtube` (`winws.exe`)
+Если параллельно с **PryWarp** на ПК запущен `zapret-discord-youtube` (`winws.exe`), его стандартный `list-general.txt` содержит `cloudflareclient.com`, из-за чего `winws.exe` может отправлять фейковые пакеты по самому зашифрованному туннелю `usque.exe` (`consumer-masque.cloudflareclient.com`), вызывая высокий пинг или откат на `HTTP/2`.
+
+Чтобы они не мешали друг другу, добавь в папку `lists/` вашего `zapret`:
+- В **`list-exclude-user.txt`**:
+  ```text
+  cloudflareclient.com
+  consumer-masque.cloudflareclient.com
+  ```
+- В **`ipset-exclude-user.txt`**:
+  ```text
+  162.159.198.0/24
+  ```
 
 ---
 

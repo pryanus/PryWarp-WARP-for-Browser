@@ -39,7 +39,7 @@ WARP_CONFIG = BRIDGE_DIR / "config.json"
 SETTINGS_FILE = BRIDGE_DIR / "bridge_settings.json"
 LOG_FILE = BRIDGE_DIR / "bridge.log"
 
-BRIDGE_VERSION = "1.1.0"
+BRIDGE_VERSION = "1.1.1"
 
 # Verified fastest Cloudflare WARP MASQUE endpoints on Rostelecom / RU networks
 PREFERRED_ENDPOINTS = ("162.159.198.1", "162.159.198.2")
@@ -52,9 +52,13 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
     "transport_mode": "auto",  # "auto" (QUIC first -> HTTP/2 failover) | "quic" | "http2"
     "probe_interval_sec": 20,
     "failover_threshold": 2,
-    "mtu": 1360,
+    "quic_retry_interval_sec": 600,
+    "mtu": 1280,
     "dns_servers": ["1.1.1.1", "1.0.0.1"],
 }
+
+_LOG_LOCK = threading.Lock()
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
 
 
 def log_line(msg: str) -> None:
@@ -64,14 +68,15 @@ def log_line(msg: str) -> None:
         print(line, flush=True)
     except Exception:
         pass
-    try:
-        if LOG_FILE.exists() and LOG_FILE.stat().st_size > 262_144:
-            tail = LOG_FILE.read_text(encoding="utf-8", errors="replace").splitlines()[-300:]
-            LOG_FILE.write_text("\n".join(tail) + "\n", encoding="utf-8")
-        with LOG_FILE.open("a", encoding="utf-8") as fh:
-            fh.write(line + "\n")
-    except OSError:
-        pass
+    with _LOG_LOCK:
+        try:
+            if LOG_FILE.exists() and LOG_FILE.stat().st_size > 262_144:
+                tail = LOG_FILE.read_text(encoding="utf-8", errors="replace").splitlines()[-300:]
+                LOG_FILE.write_text("\n".join(tail) + "\n", encoding="utf-8")
+            with LOG_FILE.open("a", encoding="utf-8") as fh:
+                fh.write(line + "\n")
+        except OSError:
+            pass
 
 
 def load_settings() -> Dict[str, Any]:
@@ -90,10 +95,13 @@ def load_settings() -> Dict[str, Any]:
     if not isinstance(data.get("dns_servers"), list) or not data["dns_servers"]:
         data["dns_servers"] = list(DEFAULT_SETTINGS["dns_servers"])
     try:
-        mtu = int(data.get("mtu", 1360))
+        mtu = int(data.get("mtu", 1280))
+        # Migrate legacy default 1360 -> official usque-supported 1280 unless marked custom
+        if mtu == 1360 and not data.get("mtu_custom"):
+            mtu = 1280
         data["mtu"] = max(1280, min(1420, mtu))
     except Exception:
-        data["mtu"] = 1360
+        data["mtu"] = 1280
     return data
 
 
@@ -291,6 +299,11 @@ class WarpSupervisor:
         self.last_probe_at: float = 0.0
         self.consecutive_failures: int = 0
         self.restarts: int = 0
+        self.proc_started_at: float = 0.0
+        self.cold_start_pending: bool = False
+        self.cold_warmup_missed: bool = False
+        self.http2_fallback_at: Optional[float] = None
+        self.quic_retry_backoff_mult: int = 1
         self.usque_version: str = self._detect_usque_version()
         self._thread: Optional[threading.Thread] = None
 
@@ -339,9 +352,33 @@ class WarpSupervisor:
             log_line(self.last_error)
             return False
 
+    def _pump_proc_output(self, proc: subprocess.Popen) -> None:
+        stream = proc.stdout
+        if stream is None:
+            return
+        try:
+            for raw_line in iter(stream.readline, ""):
+                if not raw_line:
+                    break
+                clean = _ANSI_RE.sub("", raw_line).strip()
+                if clean:
+                    log_line(f"[usque] {clean[:300]}")
+        except Exception:
+            pass
+        finally:
+            try:
+                stream.close()
+            except Exception:
+                pass
+
     def _stop_proc_locked(self) -> None:
         if self.proc is not None:
             try:
+                if self.proc.stdout is not None:
+                    try:
+                        self.proc.stdout.close()
+                    except Exception:
+                        pass
                 if self.proc.poll() is None:
                     self.proc.terminate()
                     try:
@@ -361,7 +398,7 @@ class WarpSupervisor:
         endpoint_ip = PREFERRED_ENDPOINTS[self.endpoint_idx % len(PREFERRED_ENDPOINTS)]
         _set_config_endpoint(endpoint_ip)
 
-        mtu = int(self.settings.get("mtu", 1360))
+        mtu = int(self.settings.get("mtu", 1280))
         dns_list = self.settings.get("dns_servers") or ["1.1.1.1", "1.0.0.1"]
 
         cmd = [
@@ -394,14 +431,28 @@ class WarpSupervisor:
         )
         try:
             creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-            self.proc = subprocess.Popen(
+            proc = subprocess.Popen(
                 cmd,
                 cwd=str(BRIDGE_DIR),
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                bufsize=1,
                 creationflags=creation_flags,
             )
+            self.proc = proc
+            threading.Thread(
+                target=self._pump_proc_output,
+                args=(proc,),
+                name="usque-log-pump",
+                daemon=True,
+            ).start()
             self.active_transport = transport
+            self.proc_started_at = time.time()
+            self.cold_start_pending = True
+            self.cold_warmup_missed = False
             self.state = "connecting"
             self.last_error = ""
             return True
@@ -466,6 +517,7 @@ class WarpSupervisor:
             socks_host = str(self.settings["socks_host"])
             socks_port = int(self.settings["socks_port"])
             proc_alive = self.proc is not None and self.proc.poll() is None
+            cold = self.cold_start_pending
 
         if not proc_alive:
             with self.lock:
@@ -475,7 +527,8 @@ class WarpSupervisor:
                 self.last_error = "Процесс usque остановился, перезапуск..."
             return False
 
-        ok, info = socks5_cloudflare_and_youtube_probe(socks_host, socks_port, timeout=8.0)
+        probe_timeout = 14.0 if cold else 8.0
+        ok, info = socks5_cloudflare_and_youtube_probe(socks_host, socks_port, timeout=probe_timeout)
         now = time.time()
         with self.lock:
             self.last_probe_at = now
@@ -489,8 +542,22 @@ class WarpSupervisor:
                 self.youtube_ms = info.get("youtube_ms")
                 self.last_error = ""
                 self.consecutive_failures = 0
+                self.cold_start_pending = False
+                self.cold_warmup_missed = False
+                if self.active_transport == "quic":
+                    self.http2_fallback_at = None
+                    self.quic_retry_backoff_mult = 1
                 return True
             else:
+                # Give QUIC/MASQUE one generous cold-start warm-up pass before counting towards failover
+                if self.cold_start_pending and not self.cold_warmup_missed and (now - self.proc_started_at) < 20.0:
+                    self.cold_warmup_missed = True
+                    self.state = "connecting"
+                    self.last_error = info.get("error", "Прогрев туннеля...")
+                    log_line(f"Cold-start warm-up probe on {self.active_transport}: {self.last_error}")
+                    return False
+
+                self.cold_start_pending = False
                 self.consecutive_failures += 1
                 self.warp_status = info.get("warp", "off")
                 self.youtube_ok = False
@@ -502,12 +569,13 @@ class WarpSupervisor:
                 return False
 
     def _watchdog_loop(self) -> None:
-        self.stop_event.wait(1.2)
+        self.stop_event.wait(2.2)
         while not self.stop_event.is_set():
             with self.lock:
                 proc_dead = self.proc is None or self.proc.poll() is not None
                 probe_interval = max(10, int(self.settings.get("probe_interval_sec", 20)))
                 failover_threshold = max(1, int(self.settings.get("failover_threshold", 2)))
+                quic_retry_interval = max(60, int(self.settings.get("quic_retry_interval_sec", 600)))
                 mode = self.settings.get("transport_mode", "auto")
 
             if proc_dead:
@@ -515,10 +583,32 @@ class WarpSupervisor:
                 with self.lock:
                     self.restarts += 1
                     self._start_proc_locked(self.active_transport)
-                self.stop_event.wait(1.8)
+                self.stop_event.wait(2.2)
                 continue
 
             now = time.time()
+
+            # Periodically retry QUIC when running in HTTP/2 fallback in auto mode
+            should_retry_quic = False
+            with self.lock:
+                if (
+                    mode == "auto"
+                    and self.active_transport == "http2"
+                    and self.http2_fallback_at is not None
+                    and (now - self.http2_fallback_at) >= quic_retry_interval * self.quic_retry_backoff_mult
+                ):
+                    should_retry_quic = True
+                    self.endpoint_idx = (self.endpoint_idx + 1) % len(PREFERRED_ENDPOINTS)
+                    self.restarts += 1
+                    self.consecutive_failures = 0
+                    self.http2_fallback_at = now
+                    self.quic_retry_backoff_mult = min(3, self.quic_retry_backoff_mult + 1)
+                    log_line("Auto-recovery: retrying transport http2 -> quic")
+                    self._start_proc_locked("quic")
+            if should_retry_quic:
+                self.stop_event.wait(2.2)
+                continue
+
             need_probe = (now - self.last_probe_at >= probe_interval) or (self.state != "online")
             if need_probe:
                 ok = self.run_probe()
@@ -530,6 +620,9 @@ class WarpSupervisor:
                                 next_t = "http2" if self.active_transport == "quic" else "quic"
                                 if next_t == "quic":
                                     self.endpoint_idx = (self.endpoint_idx + 1) % len(PREFERRED_ENDPOINTS)
+                                    self.http2_fallback_at = None
+                                else:
+                                    self.http2_fallback_at = time.time()
                                 log_line(
                                     f"Auto-failover: switching transport {self.active_transport} -> {next_t}"
                                 )
@@ -560,6 +653,7 @@ class WarpSupervisor:
                 "youtube_ms": self.youtube_ms,
                 "transport": self.active_transport,
                 "transport_mode": self.settings.get("transport_mode", "auto"),
+                "mtu": int(self.settings.get("mtu", 1280)),
                 "endpoint": PREFERRED_ENDPOINTS[self.endpoint_idx % len(PREFERRED_ENDPOINTS)],
                 "socks_host": self.settings["socks_host"],
                 "socks_port": int(self.settings["socks_port"]),
