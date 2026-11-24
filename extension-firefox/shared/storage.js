@@ -3,7 +3,7 @@
  * Supports Chrome, Yandex, Opera, Edge, Brave, Vivaldi, Firefox, and Tor Browser.
  */
 
-export const APP_VERSION = '1.0.1';
+export const APP_VERSION = '1.1.0';
 export const STORAGE_KEY = 'warpBridgeState';
 
 export const DEFAULT_STATE = Object.freeze({
@@ -14,7 +14,7 @@ export const DEFAULT_STATE = Object.freeze({
   socksHost: '127.0.0.1',
   socksPort: 10880,
   apiPort: 10881,
-  transportMode: 'auto', // "auto" | "http2" | "quic"
+  transportMode: 'auto', // "auto" | "awg" | "http2" | "quic"
   torFriendlyPassthrough: false,
   githubUrl: 'https://github.com/pryanus/PryWarp-WARP-for-Browser',
   autoUpdateCheck: false,

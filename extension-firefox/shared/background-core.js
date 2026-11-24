@@ -407,7 +407,7 @@ async function handleMessage(message) {
       if (Number.isFinite(Number(message.settings?.apiPort))) {
         allowed.apiPort = Math.min(65535, Math.max(1, Number(message.settings.apiPort)));
       }
-      if (['auto', 'http2', 'quic'].includes(message.settings?.transportMode)) {
+      if (['auto', 'awg', 'http2', 'quic'].includes(message.settings?.transportMode)) {
         allowed.transportMode = message.settings.transportMode;
       }
       if (typeof message.settings?.torFriendlyPassthrough === 'boolean') {

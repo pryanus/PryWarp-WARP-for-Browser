@@ -1,7 +1,11 @@
 bridge/config.json
+bridge/warp_awg.json
+bridge/mihomo_runtime.yaml
+bridge/cache.db
 bridge/bridge.log
 bridge/bridge_settings.json
 bridge/usque.exe
+bridge/mihomo.exe
 bridge/__pycache__/
 tests/__pycache__/
 .codegraph/

@@ -70,7 +70,7 @@ function Stop-Bridge {
         if (-not (Get-BridgeStatus)) { break }
     }
 
-    Get-CimInstance Win32_Process -Filter "Name='usque.exe'" | Where-Object {
+    Get-CimInstance Win32_Process -Filter "Name='mihomo.exe' OR Name='usque.exe'" | Where-Object {
         $_.ExecutablePath -like "$BridgeDir*"
     } | ForEach-Object {
         Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue
@@ -104,8 +104,8 @@ function Start-Bridge {
 
     $online = $false
     $lastSt = $null
-    for ($i = 0; $i -lt 20; $i++) {
-        Start-Sleep -Seconds 1
+    for ($i = 0; $i -lt 45; $i++) {
+        Start-Sleep -Milliseconds 350
         $st = Get-BridgeStatus
         if ($st) {
             $lastSt = $st

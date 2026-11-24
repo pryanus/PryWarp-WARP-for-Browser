@@ -13,7 +13,7 @@
         <div class="brand-line">
           <h1 class="app-title">PryWarp</h1>
           <span class="app-sub">— WARP for Browser</span>
-          <span id="versionBadge" class="version-pill tabular">v1.0.1</span>
+          <span id="versionBadge" class="version-pill tabular">v1.1.0</span>
         </div>
       </div>
       <div class="header-right">
@@ -132,9 +132,10 @@
           <div class="field-block">
             <label class="field-label" for="transportSelect">Протокол подключения</label>
             <select id="transportSelect" class="input select">
-              <option value="auto">Авто (QUIC → HTTP/2 при сбое)</option>
-              <option value="http2">Только HTTP/2 (TCP 443)</option>
-              <option value="quic">Только QUIC (HTTP/3 UDP)</option>
+              <option value="auto">Авто (AmneziaWG → HTTP/2 при сбое)</option>
+              <option value="awg">Только AmneziaWG (100+ Мбит/с)</option>
+              <option value="http2">Только HTTP/2 (TCP 443, резерв)</option>
+              <option value="quic">Только QUIC (MASQUE UDP)</option>
             </select>
           </div>
 
@@ -215,7 +216,7 @@
     </section>
 
     <footer class="footer">
-      <span id="footerInfo" class="footer-text tabular">PryWarp — WARP for Browser · v1.0.1</span>
+      <span id="footerInfo" class="footer-text tabular">PryWarp — WARP for Browser · v1.1.0</span>
       <span id="toastText" class="toast-text" role="status" aria-live="polite"></span>
     </footer>
   </div>

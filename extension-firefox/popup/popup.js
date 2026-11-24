@@ -313,7 +313,21 @@ function renderBridgeStatus(data, reachable) {
   el.statusActions.hidden = false;
   el.offlineActions.hidden = true;
   el.bridgeOfflineHint.hidden = true;
-  const transportLabel = data.transport === 'http2' ? 'HTTP/2' : 'QUIC';
+  if (
+    data.transport_mode &&
+    ['auto', 'awg', 'http2', 'quic'].includes(data.transport_mode) &&
+    document.activeElement !== el.transportSelect &&
+    el.transportSelect.value !== data.transport_mode &&
+    !el.transportSelect.disabled
+  ) {
+    el.transportSelect.value = data.transport_mode;
+  }
+  const transportLabel =
+    data.transport === 'awg'
+      ? 'AmneziaWG'
+      : data.transport === 'http2'
+        ? 'HTTP/2'
+        : 'QUIC';
   const coloPart = data.colo ? `${data.colo} · ` : '';
   const latencyPart = Number.isFinite(data.latency_ms) ? `${data.latency_ms} мс · ` : '';
 
@@ -415,6 +429,91 @@ async function detectCurrentTab() {
   }
 }
 
+async function waitForBridgeOnline(maxWaitMs = 12000) {
+  const deadline = Date.now() + maxWaitMs;
+  while (Date.now() < deadline) {
+    try {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 2000);
+      const resp = await fetch(`${getApiBase()}/api/status`, {
+        cache: 'no-store',
+        signal: controller.signal,
+      });
+      clearTimeout(timer);
+      if (resp.ok) {
+        const data = await resp.json();
+        renderBridgeStatus(data, true);
+        if (data.state === 'online' && data.warp !== 'off') {
+          lastBridgeReachable = true;
+          await sendBg({ type: 'SYNC_BRIDGE_PROXY', reachable: true, force: true });
+          return data;
+        }
+        if (data.state === 'error') {
+          return data;
+        }
+      }
+    } catch {
+      // bridge momentarily restarting
+    }
+    await new Promise((r) => setTimeout(r, 350));
+  }
+  return null;
+}
+
+async function applyBridgeTransportSwitch(mode) {
+  const label =
+    mode === 'awg'
+      ? 'AmneziaWG'
+      : mode === 'http2'
+        ? 'HTTP/2'
+        : mode === 'quic'
+          ? 'QUIC'
+          : 'Авто';
+  el.transportSelect.disabled = true;
+  el.reconnectBtn.disabled = true;
+  showToast(`Переключаю туннель на ${label}...`);
+  try {
+    const resp = await fetch(`${getApiBase()}/api/transport`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ mode }),
+    });
+    if (!resp.ok) {
+      showToast('Мост не отвечает');
+      return false;
+    }
+    const initData = await resp.json();
+    renderBridgeStatus(initData, true);
+    if (initData.state === 'online' && initData.warp !== 'off') {
+      await sendBg({ type: 'SYNC_BRIDGE_PROXY', reachable: true, force: true });
+      const reloaded = await reloadActiveTabIfProxied();
+      showToast(reloaded ? `Туннель ${label} активен — вкладка обновлена` : `Туннель ${label} активен`);
+      return true;
+    }
+    const readyData = await waitForBridgeOnline(12000);
+    if (readyData && readyData.state === 'online') {
+      const activeLabel =
+        readyData.transport === 'awg'
+          ? 'AmneziaWG'
+          : readyData.transport === 'http2'
+            ? 'HTTP/2'
+            : 'QUIC';
+      const reloaded = await reloadActiveTabIfProxied();
+      showToast(reloaded ? `Туннель ${activeLabel} готов — вкладка обновлена` : `Туннель ${activeLabel} готов`);
+      return true;
+    }
+    showToast('Туннель переподключается...');
+    return false;
+  } catch {
+    renderBridgeStatus(null, false);
+    showToast('Сначала запусти мост');
+    return false;
+  } finally {
+    el.transportSelect.disabled = false;
+    el.reconnectBtn.disabled = false;
+  }
+}
+
 async function saveAllSettings(toastMsg = 'Сохранено') {
   const rawGithub = el.githubUrlInput.value.trim();
   if (rawGithub && !parseGitHubRepoUrl(rawGithub)) {
@@ -423,6 +522,7 @@ async function saveAllSettings(toastMsg = 'Сохранено') {
     return false;
   }
 
+  const prevTransport = currentState?.transportMode || 'auto';
   const nextSettings = {
     githubUrl: rawGithub ? parseGitHubRepoUrl(rawGithub).cleanUrl : '',
     autoUpdateCheck: el.autoUpdateCheckbox.checked,
@@ -439,19 +539,11 @@ async function saveAllSettings(toastMsg = 'Сохранено') {
     proxyConflict = Boolean(res.proxyControl?.conflict);
     renderState();
 
-    try {
-      const bridgeResp = await fetch(`${getApiBase()}/api/transport`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ mode: nextSettings.transportMode }),
-      });
-      if (bridgeResp.ok) {
-        renderBridgeStatus(await bridgeResp.json(), true);
-      }
-    } catch {
-      // Bridge offline
+    if (nextSettings.transportMode !== prevTransport) {
+      await applyBridgeTransportSwitch(nextSettings.transportMode);
+    } else {
+      showToast(toastMsg);
     }
-    showToast(toastMsg);
     return true;
   }
   return false;
@@ -522,8 +614,12 @@ function bindEvents() {
   });
 
   el.reconnectBtn.addEventListener('click', async () => {
+    const prevLabel = el.reconnectBtn.textContent;
     el.reconnectBtn.disabled = true;
-    showToast('Переподключение WARP...');
+    el.reconnectBtn.textContent = 'Сброс...';
+    el.bridgeDot.className = 'status-dot dot-warn';
+    el.bridgeStateText.textContent = 'Переподключение WARP...';
+    showToast('Сбрасываю и переподключаю туннель...');
     try {
       const resp = await fetch(`${getApiBase()}/api/reconnect`, {
         method: 'POST',
@@ -532,13 +628,22 @@ function bindEvents() {
       });
       if (resp.ok) {
         const data = await resp.json();
-        await sendBg({ type: 'SYNC_BRIDGE_PROXY', reachable: true, force: true });
         renderBridgeStatus(data, true);
-        if (data.ok) {
+        const readyData =
+          data.state === 'online' && data.warp !== 'off'
+            ? data
+            : await waitForBridgeOnline(12000);
+        if (readyData && readyData.state === 'online') {
+          await sendBg({ type: 'SYNC_BRIDGE_PROXY', reachable: true, force: true });
           const reloaded = await reloadActiveTabIfProxied();
-          showToast(reloaded ? 'WARP переподключён — вкладка обновлена' : 'WARP переподключён');
+          const latText = Number.isFinite(readyData.latency_ms) ? ` (${readyData.latency_ms} мс)` : '';
+          showToast(
+            reloaded
+              ? `WARP переподключён${latText} — вкладка обновлена`
+              : `WARP переподключён${latText}`
+          );
         } else {
-          showToast('Подключается...');
+          showToast('Туннель переподключается...');
         }
       } else {
         renderBridgeStatus(null, false);
@@ -548,6 +653,7 @@ function bindEvents() {
       renderBridgeStatus(null, false);
       showToast('Сначала запусти мост');
     } finally {
+      el.reconnectBtn.textContent = prevLabel;
       el.reconnectBtn.disabled = false;
     }
   });
@@ -604,6 +710,19 @@ function bindEvents() {
       el.domainHint.className = 'helper-text is-error';
       el.domainHint.textContent = res?.error || 'Не удалось добавить домен';
     }
+  });
+
+  el.transportSelect.addEventListener('change', async () => {
+    const mode = el.transportSelect.value;
+    const res = await sendBg({
+      type: 'UPDATE_SETTINGS',
+      settings: { transportMode: mode },
+    });
+    if (res?.ok) {
+      currentState = res.state;
+      renderState();
+    }
+    await applyBridgeTransportSwitch(mode);
   });
 
   el.saveSettingsBtn.addEventListener('click', async () => {

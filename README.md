@@ -1,12 +1,12 @@
 # PryWarp — WARP for Browser
 
-**Точечный обход блокировок в браузере (YouTube и выбранные сайты) через локальный Cloudflare WARP без системного VPN-адаптера, правки `hosts`, смены DNS и влияния на игры или другие программы.**
+**Точечный обход блокировок в браузере (YouTube 4K60 и выбранные сайты) через локальный Cloudflare WARP на базе быстрого user-space AmneziaWG (`mihomo`) + резервного `HTTP/2` (`usque`) — без системного VPN-адаптера, прав администратора, правки `hosts`, смены DNS и влияния на игры или другие программы.**
 
 ---
 
 ## Скачать и установить за 2 шага
 
-> **[Скачать готовый архив (Releases)](https://github.com/pryanus/PryWarp-WARP-for-Browser/releases/latest)** — содержит всё нужное для запуска (включая `usque.exe`), сборка не требуется.
+> **[Скачать готовый архив (Releases)](https://github.com/pryanus/PryWarp-WARP-for-Browser/releases/latest)** — содержит всё нужное для запуска (включая `mihomo.exe` и `usque.exe`), сборка и ручная регистрация аккаунтов не требуются.
 
 **Требование для Windows:** установленный [Python 3.10+](https://www.python.org/downloads/) (при установке поставь галочку *«Add Python to PATH»*, либо в терминале: `winget install Python.Python.3.12`).
 
@@ -36,17 +36,19 @@
 | `УДАЛИТЬ_МОСТ.cmd` | Остановка моста и полное удаление из автозагрузки (реестр + процесс) |
 | `extension-chromium/` | Папка расширения (MV3) для движка **Chromium**: Chrome, Яндекс Браузер, Edge, Opera / GX, Brave, Vivaldi, Atom, Arc |
 | `extension-firefox/` | Папка расширения (MV3) для движка **Firefox / Gecko**: Firefox, Tor Browser, Zen, LibreWolf, Waterfox, Floorp |
-| `bridge/` | Фоновый менеджер моста (`warp_bridge.py`, `bridge_ctl.ps1`) и бинарник `usque.exe` |
+| `bridge/` | Фоновый супервайзер (`warp_bridge.py`, `bridge_ctl.ps1`), основной движок `mihomo.exe` (AmneziaWG) и резервный `usque.exe` (HTTP/2) |
 
 ---
 
 ## Как это работает (под капотом)
 
-### 1. База Cloudflare WARP (`Diniboy1123/usque`)
-В основе сетевого транспорта лежит open-source клиент Cloudflare WARP по протоколу **MASQUE** — **[Diniboy1123/usque](https://github.com/Diniboy1123/usque)** (в релиз включён оригинальный бинарник `usque v4.2.1` для `windows_amd64`).
+### 1. База Cloudflare WARP (`MetaCubeX/mihomo` + `Diniboy1123/usque`)
+Мост использует гибридную двухдвижковую схему для максимальной скорости и отказоустойчивости:
 
-- **При первом запуске** `bridge/warp_bridge.py` автоматически регистрирует бесплатный анонимный аккаунт Cloudflare WARP (`usque.exe -c config.json register -a`) и сохраняет локальную конфигурацию с ключами устройства в `bridge/config.json` только на твоём ПК.
-- **Транспорт по умолчанию:** `QUIC` (HTTP/3 поверх UDP, адреса Cloudflare MASQUE `162.159.198.1` / `162.159.198.2`, MTU `1280`, keepalive `15s`, DNS `1.1.1.1` / `1.0.0.1`) с автоматическим переключением на `HTTP/2` (TCP), если провайдер режет UDP/QUIC (и периодической попыткой авто-возврата обратно на быстрый `QUIC`). В настройках расширения можно принудительно зафиксировать `Auto`, `QUIC` или `HTTP/2`.
+- **Основной движок (по умолчанию в `Авто`):** **[MetaCubeX/mihomo](https://github.com/MetaCubeX/mihomo)** (`MIT License`) в режиме **AmneziaWG 1.5 (`+i1` QUIC-маскировка)** поверх Cloudflare WARP.
+  - При первом запуске `bridge/warp_bridge.py` сам за ~1 секунду генерирует X25519-ключ и анонимно регистрирует бесплатное устройство в официальном API Cloudflare WARP, сохраняя ключи локально в `bridge/warp_awg.json` (никаких логинов и ручных действий).
+  - Работает по пулу из 4 проверенных эндпоинтов (`162.159.192.1:2408`, `188.114.96.1:2408`, `188.114.97.1:894`, `188.114.99.224:1002`) с автоматическим `url-test` (сам выбирает самый быстрый живой узел и держит `persistent-keepalive: 25`).
+- **Резервный движок (`HTTP/2` / `QUIC`):** **[Diniboy1123/usque](https://github.com/Diniboy1123/usque)** (`MIT License`, MASQUE поверх `TCP:443`). Если у провайдера или в корпоративной сети полностью заблокирован UDP, мост в режиме `Авто` сам переключится на `HTTP/2 (TCP:443)` и будет периодически проверять возврат на `AmneziaWG`. В «Настройках» любой режим можно выбрать вручную в 1 клик.
 
 ### 2. Изоляция `user-space` (без VPN-адаптера и вмешательства в ОС)
 - `usque.exe` работает **строго в user-space** в режиме локального SOCKS5-прокси на **`127.0.0.1:10880`**, а `warp_bridge.py` следит за стабильностью процесса, проверяет фактическую доступность WARP + YouTube (`cloudflare.com/cdn-cgi/trace` + `youtube.com/generate_204`) и отдаёт лёгкий локальный API статуса на **`127.0.0.1:10881`**.
@@ -71,7 +73,8 @@
   ```
 - В **`ipset-exclude-user.txt`**:
   ```text
-  162.159.198.0/24
+  162.159.192.0/21
+  188.114.96.0/22
   ```
 
 ---
@@ -85,7 +88,9 @@ git clone https://github.com/pryanus/PryWarp-WARP-for-Browser.git
 cd PryWarp-WARP-for-Browser
 ```
 
-1. Скачай официальный архив `usque_*_windows_amd64.zip` из релизов **[Diniboy1123/usque](https://github.com/Diniboy1123/usque/releases)** и положи `usque.exe` в папку `bridge/`.
+1. Скачай официальные Windows-бинарники и положи их в папку `bridge/`:
+   - `mihomo.exe` — из релизов **[MetaCubeX/mihomo](https://github.com/MetaCubeX/mihomo/releases)** (`mihomo-windows-amd64-compatible-*.zip`, переименуй в `mihomo.exe`).
+   - `usque.exe` *(резервный HTTP/2 транспорт)* — из релизов **[Diniboy1123/usque](https://github.com/Diniboy1123/usque/releases)** (`usque_*_windows_amd64.zip`).
 2. При изменении файлов в `src/` пересобери обе папки расширений (`extension-chromium/` и `extension-firefox/`):
    ```powershell
    python build_extensions.py
@@ -104,4 +109,5 @@ cd PryWarp-WARP-for-Browser
 
 ## Благодарности
 
-- **[Diniboy1123/usque](https://github.com/Diniboy1123/usque)** — открытый клиент Cloudflare WARP MASQUE, обеспечивающий работу локального туннеля.
+- **[MetaCubeX/mihomo](https://github.com/MetaCubeX/mihomo)** (`MIT`) — высокоскоростное ядро user-space AmneziaWG + SOCKS5.
+- **[Diniboy1123/usque](https://github.com/Diniboy1123/usque)** (`MIT`) — открытый клиент Cloudflare WARP MASQUE для резервного `HTTP/2 (TCP:443)` транспорта.

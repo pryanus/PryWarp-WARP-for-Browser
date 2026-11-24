@@ -1,14 +1,18 @@
 """
-WARP Bridge Supervisor — fail-safe local Cloudflare WARP (usque) manager
-with automatic health checks (Cloudflare trace + YouTube generate_204),
-QUIC <-> HTTP/2 failover, optimal Cloudflare DNS & MTU, and localhost control API.
+PryWarp Bridge Supervisor v2.0 — high-speed, fail-safe user-space Cloudflare WARP manager.
 
-Runs strictly in user-space (SOCKS5 on 127.0.0.1:10880, API on 127.0.0.1:10881).
-Does NOT create VPN/TUN adapters, does NOT touch system routes, DNS, or hosts.
+Primary engine: MetaCubeX/mihomo running AmneziaWG 1.5 (+i1 QUIC-like handshake obfuscation)
+over a multi-endpoint Cloudflare WARP pool with automatic url-test failover and keepalive.
+Backup engine:  Diniboy1123/usque over MASQUE HTTP/2 (TCP:443) or QUIC if UDP is blocked.
+
+Runs strictly in user-space (SOCKS5 on 127.0.0.1:10880, Control API on 127.0.0.1:10881).
+Does NOT create VPN/TUN adapters, does NOT require admin rights, does NOT touch OS routes, DNS, or hosts.
 """
 
 from __future__ import annotations
 
+import base64
+import datetime
 import json
 import os
 import re
@@ -24,7 +28,7 @@ import urllib.error
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 
 def _resolve_bridge_dir() -> Path:
@@ -34,25 +38,40 @@ def _resolve_bridge_dir() -> Path:
 
 
 BRIDGE_DIR = _resolve_bridge_dir()
+MIHOMO_EXE = BRIDGE_DIR / "mihomo.exe"
 USQUE_EXE = BRIDGE_DIR / "usque.exe"
+AWG_CONFIG = BRIDGE_DIR / "warp_awg.json"
+MIHOMO_RUNTIME_YAML = BRIDGE_DIR / "mihomo_runtime.yaml"
 WARP_CONFIG = BRIDGE_DIR / "config.json"
 SETTINGS_FILE = BRIDGE_DIR / "bridge_settings.json"
 LOG_FILE = BRIDGE_DIR / "bridge.log"
 
-BRIDGE_VERSION = "1.1.1"
+BRIDGE_VERSION = "2.0.0"
 
-# Verified fastest Cloudflare WARP MASQUE endpoints on Rostelecom / RU networks
-PREFERRED_ENDPOINTS = ("162.159.198.1", "162.159.198.2")
+# Verified high-speed Cloudflare WARP AmneziaWG (+i1) endpoints (EU ARN primary + RU DME backup)
+AWG_ENDPOINTS: Tuple[Tuple[str, int], ...] = (
+    ("162.159.192.1", 2408),
+    ("188.114.96.1", 2408),
+    ("188.114.97.1", 894),
+    ("188.114.99.224", 1002),
+)
+
+# Official Cloudflare WARP MASQUE endpoints for usque fallback
+PREFERRED_MASQUE_ENDPOINTS = ("162.159.198.2", "162.159.198.1")
+HTTP2_ENDPOINT = "162.159.198.2"
+
+VALID_MODES = ("auto", "awg", "http2", "quic")
+VALID_TRANSPORTS = ("awg", "http2", "quic")
 
 DEFAULT_SETTINGS: Dict[str, Any] = {
     "socks_host": "127.0.0.1",
     "socks_port": 10880,
     "api_host": "127.0.0.1",
     "api_port": 10881,
-    "transport_mode": "auto",  # "auto" (QUIC first -> HTTP/2 failover) | "quic" | "http2"
-    "probe_interval_sec": 20,
-    "failover_threshold": 2,
-    "quic_retry_interval_sec": 600,
+    "transport_mode": "auto",  # "auto" (AmneziaWG -> HTTP/2 fallback) | "awg" | "http2" | "quic"
+    "probe_interval_sec": 45,
+    "failover_threshold": 3,
+    "recovery_retry_sec": 300,
     "mtu": 1280,
     "dns_servers": ["1.1.1.1", "1.0.0.1"],
 }
@@ -83,20 +102,19 @@ def load_settings() -> Dict[str, Any]:
     data = dict(DEFAULT_SETTINGS)
     if SETTINGS_FILE.exists():
         try:
-            loaded = json.loads(SETTINGS_FILE.read_text(encoding="utf-8"))
+            loaded = json.loads(SETTINGS_FILE.read_text(encoding="utf-8-sig"))
             if isinstance(loaded, dict):
                 data.update(loaded)
         except Exception as exc:
             log_line(f"Settings load warning: {exc}")
     data["socks_host"] = "127.0.0.1"
     data["api_host"] = "127.0.0.1"
-    if data.get("transport_mode") not in ("auto", "http2", "quic"):
+    if data.get("transport_mode") not in VALID_MODES:
         data["transport_mode"] = "auto"
     if not isinstance(data.get("dns_servers"), list) or not data["dns_servers"]:
         data["dns_servers"] = list(DEFAULT_SETTINGS["dns_servers"])
     try:
         mtu = int(data.get("mtu", 1280))
-        # Migrate legacy default 1360 -> official usque-supported 1280 unless marked custom
         if mtu == 1360 and not data.get("mtu_custom"):
             mtu = 1280
         data["mtu"] = max(1280, min(1420, mtu))
@@ -111,17 +129,219 @@ def save_settings(settings: Dict[str, Any]) -> None:
     tmp.replace(SETTINGS_FILE)
 
 
+# ---------------------------------------------------------------------------
+# Pure-Python RFC 7748 X25519 keygen + anonymous Cloudflare WARP registration
+# ---------------------------------------------------------------------------
+_X25519_P = (1 << 255) - 19
+_X25519_A24 = 121665
+
+
+def _x25519_scalarmult(k_bytes: bytes, u_bytes: bytes) -> bytes:
+    k = bytearray(k_bytes)
+    k[0] &= 248
+    k[31] &= 127
+    k[31] |= 64
+    k_int = int.from_bytes(k, "little")
+    u_int = int.from_bytes(u_bytes, "little") & ((1 << 255) - 1)
+    x_1 = u_int
+    x_2, z_2 = 1, 0
+    x_3, z_3 = u_int, 1
+    swap = 0
+    for t in range(254, -1, -1):
+        k_t = (k_int >> t) & 1
+        swap ^= k_t
+        if swap:
+            x_2, x_3 = x_3, x_2
+            z_2, z_3 = z_3, z_2
+        swap = k_t
+        A = (x_2 + z_2) % _X25519_P
+        AA = (A * A) % _X25519_P
+        B = (x_2 - z_2) % _X25519_P
+        BB = (B * B) % _X25519_P
+        E = (AA - BB) % _X25519_P
+        C = (x_3 + z_3) % _X25519_P
+        D = (x_3 - z_3) % _X25519_P
+        DA = (D * A) % _X25519_P
+        CB = (C * B) % _X25519_P
+        x_3 = pow((DA + CB) % _X25519_P, 2, _X25519_P)
+        z_3 = (x_1 * pow((DA - CB) % _X25519_P, 2, _X25519_P)) % _X25519_P
+        x_2 = (AA * BB) % _X25519_P
+        z_2 = (E * (AA + _X25519_A24 * E)) % _X25519_P
+    if swap:
+        x_2, x_3 = x_3, x_2
+        z_2, z_3 = z_3, z_2
+    res = (x_2 * pow(z_2, _X25519_P - 2, _X25519_P)) % _X25519_P
+    return res.to_bytes(32, "little")
+
+
+def _generate_wg_keypair() -> Tuple[str, str]:
+    priv = bytearray(os.urandom(32))
+    priv[0] &= 248
+    priv[31] &= 127
+    priv[31] |= 64
+    priv_b = bytes(priv)
+    pub_b = _x25519_scalarmult(priv_b, bytes([9] + [0] * 31))
+    return base64.b64encode(priv_b).decode("ascii"), base64.b64encode(pub_b).decode("ascii")
+
+
+def register_warp_awg_account() -> Optional[Dict[str, Any]]:
+    """Registers a free anonymous Cloudflare WARP WireGuard device via official API."""
+    priv_b64, pub_b64 = _generate_wg_keypair()
+    now_iso = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+    payload = json.dumps(
+        {
+            "key": pub_b64,
+            "install_id": "",
+            "fcm_token": "",
+            "tos": now_iso,
+            "model": "PC",
+            "serial_number": "",
+            "locale": "en_US",
+        }
+    ).encode("utf-8")
+
+    headers = {
+        "Content-Type": "application/json; charset=UTF-8",
+        "User-Agent": "okhttp/3.12.1",
+        "CF-Client-Version": "a-6.10-2158",
+    }
+
+    last_err = ""
+    for attempt in range(2):
+        try:
+            req = urllib.request.Request(
+                "https://api.cloudflareclient.com/v0a2158/reg",
+                data=payload,
+                headers=headers,
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+            cfg = data["config"]
+            client_id = str(cfg.get("client_id", ""))
+            reserved = list(base64.b64decode(client_id)[:3]) if client_id else [0, 0, 0]
+            account = {
+                "device_id": data.get("id", ""),
+                "private_key": priv_b64,
+                "public_key": pub_b64,
+                "peer_public_key": cfg["peers"][0]["public_key"],
+                "ip4": cfg["interface"]["addresses"]["v4"],
+                "ip6": cfg["interface"]["addresses"]["v6"],
+                "reserved": reserved,
+                "created_at": now_iso,
+            }
+            tmp = AWG_CONFIG.with_suffix(".json.tmp")
+            tmp.write_text(json.dumps(account, indent=2), encoding="utf-8")
+            tmp.replace(AWG_CONFIG)
+            log_line("Free Cloudflare WARP (AmneziaWG) key registered cleanly.")
+            return account
+        except Exception as exc:
+            last_err = str(exc)
+            time.sleep(0.8)
+
+    log_line(f"WARP AmneziaWG registration failed: {last_err}")
+    return None
+
+
+def load_or_create_awg_account() -> Optional[Dict[str, Any]]:
+    if AWG_CONFIG.exists():
+        try:
+            data = json.loads(AWG_CONFIG.read_text(encoding="utf-8-sig"))
+            if isinstance(data, dict) and data.get("private_key") and data.get("peer_public_key") and data.get("ip4"):
+                return data
+        except Exception as exc:
+            log_line(f"warp_awg.json read warning: {exc}")
+    return register_warp_awg_account()
+
+
+def write_mihomo_runtime_yaml(
+    account: Dict[str, Any],
+    socks_host: str,
+    socks_port: int,
+    mtu: int,
+    dns_servers: List[str],
+    endpoint_offset: int = 0,
+) -> Path:
+    n = len(AWG_ENDPOINTS)
+    ordered = [AWG_ENDPOINTS[(endpoint_offset + i) % n] for i in range(n)]
+    reserved = account.get("reserved") or [0, 0, 0]
+    dns_yaml = ", ".join(str(d) for d in dns_servers)
+    ip4 = str(account["ip4"]).split("/")[0]
+    ip6 = str(account.get("ip6") or "").split("/")[0]
+    ipv6_line = f"    ipv6: {ip6}\n" if ip6 else ""
+
+    proxies_blocks: List[str] = []
+    proxy_names: List[str] = []
+    for idx, (srv, port) in enumerate(ordered):
+        pname = f"WARP-{idx + 1}"
+        proxy_names.append(pname)
+        proxies_blocks.append(
+            f'  - name: "{pname}"\n'
+            f"    type: wireguard\n"
+            f"    server: {srv}\n"
+            f"    port: {port}\n"
+            f"    ip: {ip4}\n"
+            f"{ipv6_line}"
+            f'    private-key: "{account["private_key"]}"\n'
+            f'    public-key: "{account["peer_public_key"]}"\n'
+            f"    reserved: {json.dumps(reserved)}\n"
+            f"    udp: true\n"
+            f"    mtu: {mtu}\n"
+            f"    persistent-keepalive: 25\n"
+            f"    remote-dns-resolve: true\n"
+            f"    dns: [{dns_yaml}]\n"
+            f"    amnezia-wg-option:\n"
+            f"      jc: 4\n"
+            f"      jmin: 40\n"
+            f"      jmax: 70\n"
+            f"      s1: 0\n"
+            f"      s2: 0\n"
+            f"      h1: 1\n"
+            f"      h2: 2\n"
+            f"      h3: 3\n"
+            f"      h4: 4\n"
+            f'      i1: "<b 0xc700000001><r 8><b 0x00000000>"\n'
+        )
+
+    names_block = "\n".join(f"      - {p}" for p in proxy_names)
+    yaml_text = (
+        f"mixed-port: {socks_port}\n"
+        f"bind-address: {socks_host}\n"
+        f"allow-lan: false\n"
+        f"mode: global\n"
+        f"log-level: warning\n"
+        f"ipv6: true\n"
+        f"\n"
+        f"proxies:\n"
+        + "".join(proxies_blocks)
+        + "\n"
+        f"proxy-groups:\n"
+        f"  - name: GLOBAL\n"
+        f"    type: url-test\n"
+        f'    url: "https://www.cloudflare.com/cdn-cgi/trace"\n'
+        f"    interval: 90\n"
+        f"    tolerance: 80\n"
+        f"    lazy: false\n"
+        f"    proxies:\n"
+        f"{names_block}\n"
+    )
+
+    tmp = MIHOMO_RUNTIME_YAML.with_suffix(".yaml.tmp")
+    tmp.write_text(yaml_text, encoding="utf-8")
+    tmp.replace(MIHOMO_RUNTIME_YAML)
+    return MIHOMO_RUNTIME_YAML
+
+
+# ---------------------------------------------------------------------------
+# SOCKS5 health & latency probes
+# ---------------------------------------------------------------------------
 def _socks5_https_get(
     socks_host: str,
     socks_port: int,
     target_host: str,
     target_path: str,
-    timeout: float = 8.0,
+    timeout: float = 6.0,
 ) -> Tuple[bool, int, str, int, str]:
-    """
-    Lightweight HTTPS GET over SOCKS5 (ATYP=domain) using Python stdlib sockets + TLS.
-    Returns (ok, http_status, body_text, latency_ms, error_msg).
-    """
     started = time.perf_counter()
     raw_sock: Optional[socket.socket] = None
     tls_sock: Optional[ssl.SSLSocket] = None
@@ -129,13 +349,11 @@ def _socks5_https_get(
         raw_sock = socket.create_connection((socks_host, socks_port), timeout=timeout)
         raw_sock.settimeout(timeout)
 
-        # SOCKS5 greeting: VER=5, NMETHODS=1, NO AUTH(0x00)
         raw_sock.sendall(b"\x05\x01\x00")
         resp = raw_sock.recv(2)
         if len(resp) != 2 or resp[0] != 5 or resp[1] != 0:
             return False, 0, "", 0, f"SOCKS5 auth failed: {resp!r}"
 
-        # SOCKS5 CONNECT with domain name (ATYP=0x03) so DNS runs inside WARP tunnel
         host_bytes = target_host.encode("ascii")
         req = b"\x05\x01\x00\x03" + bytes([len(host_bytes)]) + host_bytes + struct.pack("!H", 443)
         raw_sock.sendall(req)
@@ -161,7 +379,7 @@ def _socks5_https_get(
         http_req = (
             f"GET {target_path} HTTP/1.1\r\n"
             f"Host: {target_host}\r\n"
-            f"User-Agent: WARP-Bridge/{BRIDGE_VERSION}\r\n"
+            f"User-Agent: PryWarp-Bridge/{BRIDGE_VERSION}\r\n"
             f"Connection: close\r\n\r\n"
         ).encode("ascii")
         tls_sock.sendall(http_req)
@@ -195,17 +413,43 @@ def _socks5_https_get(
                     pass
 
 
+def _wait_socks_port(socks_host: str, socks_port: int, timeout: float = 4.0) -> bool:
+    deadline = time.perf_counter() + timeout
+    while time.perf_counter() < deadline:
+        try:
+            with socket.create_connection((socks_host, socks_port), timeout=0.3):
+                return True
+        except OSError:
+            time.sleep(0.08)
+    return False
+
+
 def socks5_cloudflare_and_youtube_probe(
     socks_host: str,
     socks_port: int,
-    timeout: float = 8.0,
+    timeout: float = 6.0,
 ) -> Tuple[bool, Dict[str, Any]]:
-    """
-    Verifies both Cloudflare WARP tunnel (warp=on) and real YouTube reachability (HTTP 204).
-    """
-    ok, status, body, latency_ms, err = _socks5_https_get(
-        socks_host, socks_port, "www.cloudflare.com", "/cdn-cgi/trace", timeout=timeout
-    )
+    cf_res: Dict[str, Any] = {}
+    yt_res: Dict[str, Any] = {}
+
+    def _run_cf() -> None:
+        cf_res["val"] = _socks5_https_get(
+            socks_host, socks_port, "www.cloudflare.com", "/cdn-cgi/trace", timeout=timeout
+        )
+
+    def _run_yt() -> None:
+        yt_res["val"] = _socks5_https_get(
+            socks_host, socks_port, "www.youtube.com", "/generate_204", timeout=timeout
+        )
+
+    t1 = threading.Thread(target=_run_cf, daemon=True)
+    t2 = threading.Thread(target=_run_yt, daemon=True)
+    t1.start()
+    t2.start()
+    t1.join(timeout + 1.5)
+    t2.join(timeout + 1.5)
+
+    ok, status, body, latency_ms, err = cf_res.get("val", (False, 0, "", 0, "Cloudflare probe timeout"))
     if not ok or status != 200:
         return False, {"error": err or f"Cloudflare trace HTTP {status}"}
 
@@ -227,10 +471,7 @@ def socks5_cloudflare_and_youtube_probe(
             "error": f"Unexpected warp state: {warp_state}",
         }
 
-    # Verify real YouTube reachability over the same tunnel
-    yt_ok, yt_status, _, yt_ms, yt_err = _socks5_https_get(
-        socks_host, socks_port, "www.youtube.com", "/generate_204", timeout=timeout
-    )
+    yt_ok, yt_status, _, yt_ms, yt_err = yt_res.get("val", (False, 0, "", 0, "YouTube probe timeout"))
     if not yt_ok or yt_status not in (200, 204):
         return False, {
             "warp": warp_state,
@@ -251,30 +492,33 @@ def socks5_cloudflare_and_youtube_probe(
     }
 
 
-def _set_config_endpoint(endpoint_ip: str) -> None:
-    """Safely updates endpoint_v4/endpoint_h2_v4 in config.json without touching keys."""
+def _set_usque_config_endpoint(endpoint_ip: str) -> None:
     if not WARP_CONFIG.exists():
         return
     try:
-        data = json.loads(WARP_CONFIG.read_text(encoding="utf-8"))
+        data = json.loads(WARP_CONFIG.read_text(encoding="utf-8-sig"))
         if not isinstance(data, dict):
             return
         changed = False
         if data.get("endpoint_v4") != endpoint_ip:
             data["endpoint_v4"] = endpoint_ip
             changed = True
-        if data.get("endpoint_h2_v4") != endpoint_ip:
-            data["endpoint_h2_v4"] = endpoint_ip
+        # Always keep cert-pinned HTTP/2 endpoint on 162.159.198.2
+        if data.get("endpoint_h2_v4") != HTTP2_ENDPOINT:
+            data["endpoint_h2_v4"] = HTTP2_ENDPOINT
             changed = True
         if changed:
             tmp = WARP_CONFIG.with_suffix(".json.tmp")
             tmp.write_text(json.dumps(data, indent=2), encoding="utf-8")
             tmp.replace(WARP_CONFIG)
-            log_line(f"Updated WARP MASQUE endpoint to {endpoint_ip}")
+            log_line(f"Updated usque endpoints (quic={endpoint_ip}, h2={HTTP2_ENDPOINT})")
     except Exception as exc:
         log_line(f"Endpoint update warning: {exc}")
 
 
+# ---------------------------------------------------------------------------
+# Hybrid Fail-Safe Supervisor (AmneziaWG via mihomo + MASQUE via usque)
+# ---------------------------------------------------------------------------
 class WarpSupervisor:
     def __init__(self, settings: Dict[str, Any]) -> None:
         self.settings = settings
@@ -282,11 +526,17 @@ class WarpSupervisor:
         self.stop_event = threading.Event()
         self.proc: Optional[subprocess.Popen] = None
 
-        # In auto mode, start with QUIC (HTTP/3 UDP) — 3-5x faster for YouTube videoplayback;
-        # auto-fails over to HTTP/2 TCP if QUIC fails 2 probes in a row.
+        self.has_mihomo: bool = MIHOMO_EXE.exists()
+        self.has_usque: bool = USQUE_EXE.exists()
+        self.mihomo_version: str = self._detect_mihomo_version()
+        self.usque_version: str = self._detect_usque_version()
+
         mode = settings.get("transport_mode", "auto")
-        self.active_transport: str = "http2" if mode == "http2" else "quic"
-        self.endpoint_idx: int = 0
+        self.active_transport: str = self._resolve_initial_transport(mode)
+        self.active_engine: str = "mihomo" if self.active_transport == "awg" else "usque"
+        self.awg_endpoint_idx: int = 0
+        self.masque_endpoint_idx: int = 0
+
         self.state: str = "starting"
         self.warp_status: str = "off"
         self.colo: str = ""
@@ -299,13 +549,40 @@ class WarpSupervisor:
         self.last_probe_at: float = 0.0
         self.consecutive_failures: int = 0
         self.restarts: int = 0
+        self.proc_gen: int = 0
         self.proc_started_at: float = 0.0
         self.cold_start_pending: bool = False
         self.cold_warmup_missed: bool = False
-        self.http2_fallback_at: Optional[float] = None
-        self.quic_retry_backoff_mult: int = 1
-        self.usque_version: str = self._detect_usque_version()
+        self.fallback_since: Optional[float] = None
+        self.recovery_backoff_mult: int = 1
+        self.masque_connected_event = threading.Event()
+        self.socks_listening_event = threading.Event()
         self._thread: Optional[threading.Thread] = None
+
+    def _resolve_initial_transport(self, mode: str) -> str:
+        if mode == "awg":
+            return "awg" if self.has_mihomo else ("http2" if self.has_usque else "awg")
+        if mode in ("http2", "quic"):
+            return mode if self.has_usque else ("awg" if self.has_mihomo else mode)
+        # "auto": AmneziaWG (mihomo) primary -> HTTP/2 (usque) backup
+        return "awg" if self.has_mihomo else "http2"
+
+    def _detect_mihomo_version(self) -> str:
+        if not MIHOMO_EXE.exists():
+            return "missing"
+        try:
+            res = subprocess.run(
+                [str(MIHOMO_EXE), "-v"],
+                capture_output=True,
+                text=True,
+                timeout=4,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+            out = (res.stdout or res.stderr or "").strip()
+            m = re.search(r"v\d+\.\d+\.\d+", out)
+            return m.group(0) if m else "installed"
+        except Exception:
+            return "installed"
 
     def _detect_usque_version(self) -> str:
         if not USQUE_EXE.exists():
@@ -320,11 +597,11 @@ class WarpSupervisor:
             )
             out = (res.stdout or res.stderr or "").strip()
             m = re.search(r"v?\d+\.\d+\.\d+", out)
-            return m.group(0) if m else (out[:32] or "installed")
+            return m.group(0) if m else "installed"
         except Exception:
             return "installed"
 
-    def _ensure_registered(self) -> bool:
+    def _ensure_usque_registered(self) -> bool:
         if not USQUE_EXE.exists():
             self.state = "error"
             self.last_error = f"Не найден бинарник usque.exe в {BRIDGE_DIR}"
@@ -332,7 +609,7 @@ class WarpSupervisor:
             return False
         if WARP_CONFIG.exists() and WARP_CONFIG.stat().st_size > 100:
             return True
-        log_line("WARP config.json missing — registering free Cloudflare WARP account...")
+        log_line("WARP config.json missing — registering free Cloudflare WARP (usque)...")
         try:
             res = subprocess.run(
                 [str(USQUE_EXE), "-c", str(WARP_CONFIG), "register", "-a"],
@@ -342,7 +619,7 @@ class WarpSupervisor:
                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
             )
             if res.returncode == 0 and WARP_CONFIG.exists():
-                log_line("Free WARP registration succeeded.")
+                log_line("Free WARP (usque) registration succeeded.")
                 return True
             self.last_error = f"Ошибка регистрации WARP (код {res.returncode})"
             log_line(self.last_error)
@@ -352,7 +629,7 @@ class WarpSupervisor:
             log_line(self.last_error)
             return False
 
-    def _pump_proc_output(self, proc: subprocess.Popen) -> None:
+    def _pump_proc_output(self, proc: subprocess.Popen, tag: str) -> None:
         stream = proc.stdout
         if stream is None:
             return
@@ -361,8 +638,13 @@ class WarpSupervisor:
                 if not raw_line:
                     break
                 clean = _ANSI_RE.sub("", raw_line).strip()
-                if clean:
-                    log_line(f"[usque] {clean[:300]}")
+                if not clean:
+                    continue
+                if "SOCKS proxy listening" in clean or "Mixed(http+socks) proxy listening" in clean:
+                    self.socks_listening_event.set()
+                if "Connected to MASQUE server" in clean:
+                    self.masque_connected_event.set()
+                log_line(f"[{tag}] {clean[:300]}")
         except Exception:
             pass
         finally:
@@ -373,62 +655,101 @@ class WarpSupervisor:
 
     def _stop_proc_locked(self) -> None:
         if self.proc is not None:
+            proc = self.proc
+            self.proc = None
             try:
-                if self.proc.stdout is not None:
+                if proc.poll() is None:
+                    proc.terminate()
                     try:
-                        self.proc.stdout.close()
-                    except Exception:
-                        pass
-                if self.proc.poll() is None:
-                    self.proc.terminate()
-                    try:
-                        self.proc.wait(timeout=3)
+                        proc.wait(timeout=2)
                     except subprocess.TimeoutExpired:
-                        self.proc.kill()
-                        self.proc.wait(timeout=2)
+                        proc.kill()
+                        proc.wait(timeout=2)
             except Exception:
                 pass
-            self.proc = None
 
     def _start_proc_locked(self, transport: str) -> bool:
         self._stop_proc_locked()
-        if not self._ensure_registered():
-            return False
-
-        endpoint_ip = PREFERRED_ENDPOINTS[self.endpoint_idx % len(PREFERRED_ENDPOINTS)]
-        _set_config_endpoint(endpoint_ip)
+        self.masque_connected_event.clear()
+        self.socks_listening_event.clear()
 
         mtu = int(self.settings.get("mtu", 1280))
-        dns_list = self.settings.get("dns_servers") or ["1.1.1.1", "1.0.0.1"]
+        dns_list = list(self.settings.get("dns_servers") or ["1.1.1.1", "1.0.0.1"])
+        socks_host = str(self.settings["socks_host"])
+        socks_port = int(self.settings["socks_port"])
 
-        cmd = [
-            str(USQUE_EXE),
-            "-c",
-            str(WARP_CONFIG),
-            "socks",
-            "-b",
-            str(self.settings["socks_host"]),
-            "-p",
-            str(self.settings["socks_port"]),
-            "--always-reconnect",
-            "-m",
-            str(mtu),
-            "-k",
-            "15s",
-            "-t",
-            "2s",
-            "-r",
-            "1s",
-        ]
-        for dns_ip in dns_list:
-            cmd.extend(["-d", str(dns_ip)])
-        if transport == "http2":
-            cmd.append("--http2")
+        if transport == "awg":
+            if not MIHOMO_EXE.exists():
+                if USQUE_EXE.exists():
+                    log_line("mihomo.exe missing — falling back to usque HTTP/2")
+                    return self._start_proc_locked("http2")
+                self.state = "error"
+                self.last_error = f"Не найден mihomo.exe в {BRIDGE_DIR}"
+                log_line(self.last_error)
+                return False
 
-        log_line(
-            f"Starting usque ({transport}, ep={endpoint_ip}, mtu={mtu}, dns={','.join(dns_list)}) "
-            f"on {self.settings['socks_host']}:{self.settings['socks_port']}"
-        )
+            account = load_or_create_awg_account()
+            if not account:
+                if self.settings.get("transport_mode", "auto") == "auto" and USQUE_EXE.exists():
+                    log_line("AmneziaWG registration unavailable — falling back to usque HTTP/2")
+                    self.fallback_since = time.time()
+                    return self._start_proc_locked("http2")
+                self.state = "error"
+                self.last_error = "Не удалось получить анонимный ключ WARP"
+                return False
+
+            cfg_path = write_mihomo_runtime_yaml(
+                account=account,
+                socks_host=socks_host,
+                socks_port=socks_port,
+                mtu=mtu,
+                dns_servers=dns_list,
+                endpoint_offset=self.awg_endpoint_idx,
+            )
+            primary_ep = AWG_ENDPOINTS[self.awg_endpoint_idx % len(AWG_ENDPOINTS)]
+            cmd = [str(MIHOMO_EXE), "-d", str(BRIDGE_DIR), "-f", str(cfg_path)]
+            tag = "mihomo"
+            engine = "mihomo"
+            log_line(
+                f"Starting mihomo AmneziaWG (+i1, primary={primary_ep[0]}:{primary_ep[1]}, pool={len(AWG_ENDPOINTS)}, mtu={mtu}) "
+                f"on {socks_host}:{socks_port}"
+            )
+        else:
+            if not self._ensure_usque_registered():
+                return False
+            endpoint_ip = PREFERRED_MASQUE_ENDPOINTS[self.masque_endpoint_idx % len(PREFERRED_MASQUE_ENDPOINTS)]
+            _set_usque_config_endpoint(endpoint_ip)
+            cmd = [
+                str(USQUE_EXE),
+                "-c",
+                str(WARP_CONFIG),
+                "socks",
+                "-b",
+                socks_host,
+                "-p",
+                str(socks_port),
+                "--always-reconnect",
+                "-m",
+                str(mtu),
+                "-k",
+                "15s",
+                "-t",
+                "2s",
+                "-r",
+                "1s",
+            ]
+            for dns_ip in dns_list:
+                cmd.extend(["-d", str(dns_ip)])
+            if transport == "http2":
+                cmd.append("--http2")
+            tag = "usque"
+            engine = "usque"
+            shown_ep = HTTP2_ENDPOINT if transport == "http2" else endpoint_ip
+            log_line(
+                f"Starting usque ({transport}, ep={shown_ep}, mtu={mtu}, dns={','.join(dns_list)}) "
+                f"on {socks_host}:{socks_port}"
+            )
+
         try:
             creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
             proc = subprocess.Popen(
@@ -443,22 +764,29 @@ class WarpSupervisor:
                 creationflags=creation_flags,
             )
             self.proc = proc
+            self.proc_gen += 1
             threading.Thread(
                 target=self._pump_proc_output,
-                args=(proc,),
-                name="usque-log-pump",
+                args=(proc, tag),
+                name=f"{tag}-log-pump",
                 daemon=True,
             ).start()
             self.active_transport = transport
+            self.active_engine = engine
             self.proc_started_at = time.time()
             self.cold_start_pending = True
             self.cold_warmup_missed = False
             self.state = "connecting"
+            self.warp_status = "off"
+            self.colo = ""
+            self.latency_ms = None
+            self.youtube_ms = None
+            self.youtube_ok = False
             self.last_error = ""
             return True
         except Exception as exc:
             self.state = "error"
-            self.last_error = f"Не удалось запустить usque.exe: {exc}"
+            self.last_error = f"Не удалось запустить {engine}: {exc}"
             log_line(self.last_error)
             return False
 
@@ -477,39 +805,62 @@ class WarpSupervisor:
             self.youtube_ok = False
         log_line("WARP Bridge stopped cleanly.")
 
-    def reconnect(self, force_transport: Optional[str] = None) -> Dict[str, Any]:
+    def _wait_ready_before_probe(self) -> None:
         with self.lock:
-            if force_transport in ("http2", "quic"):
+            socks_host = str(self.settings["socks_host"])
+            socks_port = int(self.settings["socks_port"])
+            engine = self.active_engine
+        if engine == "mihomo":
+            _wait_socks_port(socks_host, socks_port, timeout=3.0)
+            time.sleep(0.15)
+        else:
+            if not self.socks_listening_event.wait(timeout=2.5):
+                _wait_socks_port(socks_host, socks_port, timeout=1.5)
+            self.masque_connected_event.wait(timeout=2.0)
+
+    def _probe_after_switch(self) -> None:
+        self._wait_ready_before_probe()
+        if not self.stop_event.is_set():
+            self.run_probe()
+
+    def reconnect(self, force_transport: Optional[str] = None, wait: bool = False) -> Dict[str, Any]:
+        with self.lock:
+            if force_transport in VALID_TRANSPORTS:
                 target = force_transport
-            elif self.settings["transport_mode"] in ("http2", "quic"):
-                target = self.settings["transport_mode"]
             else:
-                target = self.active_transport
-                # On manual reconnect in auto mode, also rotate endpoint if previous had errors
-                if self.last_error:
-                    self.endpoint_idx = (self.endpoint_idx + 1) % len(PREFERRED_ENDPOINTS)
+                mode = self.settings.get("transport_mode", "auto")
+                target = self._resolve_initial_transport(mode)
+                # Manual Reset rotates primary endpoint in the pool for a fresh route
+                if target == "awg":
+                    self.awg_endpoint_idx = (self.awg_endpoint_idx + 1) % len(AWG_ENDPOINTS)
+                elif target == "quic":
+                    self.masque_endpoint_idx = (self.masque_endpoint_idx + 1) % len(PREFERRED_MASQUE_ENDPOINTS)
             self.restarts += 1
             self.consecutive_failures = 0
+            self.fallback_since = None
+            self.recovery_backoff_mult = 1
+            log_line(f"Reconnect requested (target={target}, restart #{self.restarts})")
             self._start_proc_locked(target)
-        time.sleep(1.5)
-        self.run_probe()
+        if wait:
+            self._probe_after_switch()
+        else:
+            threading.Thread(target=self._probe_after_switch, name="warp-switch-probe", daemon=True).start()
         return self.get_status()
 
     def set_transport_mode(self, mode: str) -> Dict[str, Any]:
-        if mode not in ("auto", "http2", "quic"):
+        if mode not in VALID_MODES:
             raise ValueError("Invalid transport mode")
         restart_needed = False
+        target = self.active_transport
         with self.lock:
+            prev_mode = self.settings.get("transport_mode", "auto")
             self.settings["transport_mode"] = mode
             save_settings(self.settings)
-            if mode in ("http2", "quic") and self.active_transport != mode:
-                self.active_transport = mode
-                restart_needed = True
-            elif mode == "auto" and self.active_transport != "quic":
-                self.active_transport = "quic"
+            target = self._resolve_initial_transport(mode)
+            if self.active_transport != target or prev_mode != mode or self.state != "online":
                 restart_needed = True
         if restart_needed:
-            return self.reconnect(force_transport=self.active_transport)
+            return self.reconnect(force_transport=target, wait=False)
         return self.get_status()
 
     def run_probe(self) -> bool:
@@ -518,19 +869,24 @@ class WarpSupervisor:
             socks_port = int(self.settings["socks_port"])
             proc_alive = self.proc is not None and self.proc.poll() is None
             cold = self.cold_start_pending
+            gen = self.proc_gen
 
         if not proc_alive:
             with self.lock:
+                if self.proc_gen != gen:
+                    return False
                 self.state = "reconnecting"
                 self.warp_status = "off"
                 self.youtube_ok = False
-                self.last_error = "Процесс usque остановился, перезапуск..."
+                self.last_error = f"Процесс {self.active_engine} остановился, перезапуск..."
             return False
 
-        probe_timeout = 14.0 if cold else 8.0
+        probe_timeout = 7.0 if cold else 6.0
         ok, info = socks5_cloudflare_and_youtube_probe(socks_host, socks_port, timeout=probe_timeout)
         now = time.time()
         with self.lock:
+            if self.proc_gen != gen or self.stop_event.is_set():
+                return False
             self.last_probe_at = now
             if ok:
                 self.state = "online"
@@ -544,13 +900,12 @@ class WarpSupervisor:
                 self.consecutive_failures = 0
                 self.cold_start_pending = False
                 self.cold_warmup_missed = False
-                if self.active_transport == "quic":
-                    self.http2_fallback_at = None
-                    self.quic_retry_backoff_mult = 1
+                if self.active_transport == "awg":
+                    self.fallback_since = None
+                    self.recovery_backoff_mult = 1
                 return True
             else:
-                # Give QUIC/MASQUE one generous cold-start warm-up pass before counting towards failover
-                if self.cold_start_pending and not self.cold_warmup_missed and (now - self.proc_started_at) < 20.0:
+                if self.cold_start_pending and not self.cold_warmup_missed and (now - self.proc_started_at) < 16.0:
                     self.cold_warmup_missed = True
                     self.state = "connecting"
                     self.last_error = info.get("error", "Прогрев туннеля...")
@@ -569,80 +924,124 @@ class WarpSupervisor:
                 return False
 
     def _watchdog_loop(self) -> None:
-        self.stop_event.wait(2.2)
+        self._wait_ready_before_probe()
+        prev_tick = time.time()
         while not self.stop_event.is_set():
-            with self.lock:
-                proc_dead = self.proc is None or self.proc.poll() is not None
-                probe_interval = max(10, int(self.settings.get("probe_interval_sec", 20)))
-                failover_threshold = max(1, int(self.settings.get("failover_threshold", 2)))
-                quic_retry_interval = max(60, int(self.settings.get("quic_retry_interval_sec", 600)))
-                mode = self.settings.get("transport_mode", "auto")
+            try:
+                now = time.time()
+                woke_from_sleep = (now - prev_tick) > 30.0
+                prev_tick = now
+                if woke_from_sleep:
+                    log_line("System resume detected — re-verifying WARP tunnel immediately.")
 
-            if proc_dead:
-                log_line("Watchdog detected usque exit — restarting...")
                 with self.lock:
-                    self.restarts += 1
-                    self._start_proc_locked(self.active_transport)
-                self.stop_event.wait(2.2)
-                continue
+                    proc_dead = self.proc is None or self.proc.poll() is not None
+                    probe_interval = max(10, int(self.settings.get("probe_interval_sec", 45)))
+                    failover_threshold = max(2, int(self.settings.get("failover_threshold", 3)))
+                    recovery_retry = max(60, int(self.settings.get("recovery_retry_sec", 300)))
+                    mode = self.settings.get("transport_mode", "auto")
 
-            now = time.time()
-
-            # Periodically retry QUIC when running in HTTP/2 fallback in auto mode
-            should_retry_quic = False
-            with self.lock:
-                if (
-                    mode == "auto"
-                    and self.active_transport == "http2"
-                    and self.http2_fallback_at is not None
-                    and (now - self.http2_fallback_at) >= quic_retry_interval * self.quic_retry_backoff_mult
-                ):
-                    should_retry_quic = True
-                    self.endpoint_idx = (self.endpoint_idx + 1) % len(PREFERRED_ENDPOINTS)
-                    self.restarts += 1
-                    self.consecutive_failures = 0
-                    self.http2_fallback_at = now
-                    self.quic_retry_backoff_mult = min(3, self.quic_retry_backoff_mult + 1)
-                    log_line("Auto-recovery: retrying transport http2 -> quic")
-                    self._start_proc_locked("quic")
-            if should_retry_quic:
-                self.stop_event.wait(2.2)
-                continue
-
-            need_probe = (now - self.last_probe_at >= probe_interval) or (self.state != "online")
-            if need_probe:
-                ok = self.run_probe()
-                if not ok:
+                if proc_dead:
+                    log_line(f"Watchdog detected {self.active_engine} exit — restarting...")
                     with self.lock:
-                        failures = self.consecutive_failures
-                        if failures >= failover_threshold:
-                            if mode == "auto":
-                                next_t = "http2" if self.active_transport == "quic" else "quic"
-                                if next_t == "quic":
-                                    self.endpoint_idx = (self.endpoint_idx + 1) % len(PREFERRED_ENDPOINTS)
-                                    self.http2_fallback_at = None
-                                else:
-                                    self.http2_fallback_at = time.time()
-                                log_line(
-                                    f"Auto-failover: switching transport {self.active_transport} -> {next_t}"
-                                )
-                            else:
-                                next_t = self.active_transport
-                                self.endpoint_idx = (self.endpoint_idx + 1) % len(PREFERRED_ENDPOINTS)
-                                log_line(f"Watchdog restarting transport {next_t} on next endpoint")
-                            self.restarts += 1
-                            self.consecutive_failures = 0
-                            self._start_proc_locked(next_t)
-                    self.stop_event.wait(2.5)
+                        self.restarts += 1
+                        self._start_proc_locked(self.active_transport)
+                    self._wait_ready_before_probe()
                     continue
+
+                # In auto mode, periodically recover from backup HTTP/2 back to high-speed AmneziaWG
+                should_recover = False
+                with self.lock:
+                    if (
+                        mode == "auto"
+                        and self.has_mihomo
+                        and self.active_transport != "awg"
+                        and self.fallback_since is not None
+                        and (now - self.fallback_since) >= recovery_retry * self.recovery_backoff_mult
+                    ):
+                        should_recover = True
+                        self.restarts += 1
+                        self.consecutive_failures = 0
+                        self.fallback_since = now
+                        self.recovery_backoff_mult = min(3, self.recovery_backoff_mult + 1)
+                        log_line(f"Auto-recovery: retrying primary transport {self.active_transport} -> awg")
+                        self._start_proc_locked("awg")
+                if should_recover:
+                    self._wait_ready_before_probe()
+                    continue
+
+                need_probe = woke_from_sleep or (now - self.last_probe_at >= probe_interval) or (self.state != "online")
+                if need_probe:
+                    ok = self.run_probe()
+                    if not ok:
+                        need_wait_ready = False
+                        with self.lock:
+                            failures = self.consecutive_failures
+                            # Priority to AmneziaWG: on failure #2 try restarting mihomo on the next endpoint first;
+                            # only fall back to HTTP/2 on full outage (>= failover_threshold, default 3).
+                            if (
+                                mode == "auto"
+                                and self.active_transport == "awg"
+                                and failures == failover_threshold - 1
+                                and failures >= 2
+                            ):
+                                self.awg_endpoint_idx = (self.awg_endpoint_idx + 1) % len(AWG_ENDPOINTS)
+                                self.restarts += 1
+                                log_line("AmneziaWG soft-retry: rotating endpoint before any HTTP/2 fallback")
+                                self._start_proc_locked("awg")
+                                need_wait_ready = True
+                            elif failures >= failover_threshold:
+                                if mode == "auto":
+                                    if self.active_transport == "awg" and self.has_usque:
+                                        next_t = "http2"
+                                        self.fallback_since = time.time()
+                                    elif self.active_transport == "http2" and self.has_mihomo:
+                                        next_t = "awg"
+                                        self.awg_endpoint_idx = (self.awg_endpoint_idx + 1) % len(AWG_ENDPOINTS)
+                                        self.fallback_since = None
+                                    else:
+                                        next_t = self.active_transport
+                                        self.awg_endpoint_idx = (self.awg_endpoint_idx + 1) % len(AWG_ENDPOINTS)
+                                    log_line(
+                                        f"Auto-failover: switching transport {self.active_transport} -> {next_t}"
+                                    )
+                                else:
+                                    next_t = self.active_transport
+                                    if next_t == "awg":
+                                        self.awg_endpoint_idx = (self.awg_endpoint_idx + 1) % len(AWG_ENDPOINTS)
+                                    elif next_t == "quic":
+                                        self.masque_endpoint_idx = (self.masque_endpoint_idx + 1) % len(
+                                            PREFERRED_MASQUE_ENDPOINTS
+                                        )
+                                    log_line(f"Watchdog restarting {next_t} on rotated endpoint")
+                                self.restarts += 1
+                                self.consecutive_failures = 0
+                                self._start_proc_locked(next_t)
+                                need_wait_ready = True
+                        if need_wait_ready:
+                            self._wait_ready_before_probe()
+                            continue
+            except Exception as exc:
+                log_line(f"Watchdog loop recovered from error: {exc}")
 
             self.stop_event.wait(2.5)
 
     def get_status(self) -> Dict[str, Any]:
         with self.lock:
+            if self.active_transport == "awg":
+                ep_host, ep_port = AWG_ENDPOINTS[self.awg_endpoint_idx % len(AWG_ENDPOINTS)]
+                ep_str = f"{ep_host}:{ep_port}"
+            elif self.active_transport == "http2":
+                ep_str = f"{HTTP2_ENDPOINT}:443"
+            else:
+                ep_str = f"{PREFERRED_MASQUE_ENDPOINTS[self.masque_endpoint_idx % len(PREFERRED_MASQUE_ENDPOINTS)]}:443"
+
+            pid = self.proc.pid if (self.proc is not None and self.proc.poll() is None) else None
             return {
                 "ok": self.state == "online",
                 "bridge_version": BRIDGE_VERSION,
+                "engine": self.active_engine,
+                "mihomo_version": self.mihomo_version,
                 "usque_version": self.usque_version,
                 "state": self.state,
                 "warp": self.warp_status,
@@ -654,24 +1053,26 @@ class WarpSupervisor:
                 "transport": self.active_transport,
                 "transport_mode": self.settings.get("transport_mode", "auto"),
                 "mtu": int(self.settings.get("mtu", 1280)),
-                "endpoint": PREFERRED_ENDPOINTS[self.endpoint_idx % len(PREFERRED_ENDPOINTS)],
+                "endpoint": ep_str,
                 "socks_host": self.settings["socks_host"],
                 "socks_port": int(self.settings["socks_port"]),
                 "api_port": int(self.settings["api_port"]),
                 "uptime_sec": int(time.time() - self.started_at),
                 "restarts": self.restarts,
+                "engine_pid": pid,
+                "usque_pid": pid,
                 "last_error": self.last_error,
                 "install_dir": str(BRIDGE_DIR),
             }
 
 
-def check_usque_github_release() -> Dict[str, Any]:
-    url = "https://api.github.com/repos/Diniboy1123/usque/releases/latest"
+def check_engine_github_release() -> Dict[str, Any]:
+    url = "https://api.github.com/repos/MetaCubeX/mihomo/releases/latest"
     req = urllib.request.Request(
         url,
         headers={
             "Accept": "application/vnd.github+json",
-            "User-Agent": f"WARP-Bridge/{BRIDGE_VERSION}",
+            "User-Agent": f"PryWarp-Bridge/{BRIDGE_VERSION}",
         },
     )
     try:
@@ -680,7 +1081,7 @@ def check_usque_github_release() -> Dict[str, Any]:
         return {
             "ok": True,
             "latest_tag": data.get("tag_name", ""),
-            "html_url": data.get("html_url", "https://github.com/Diniboy1123/usque/releases"),
+            "html_url": data.get("html_url", "https://github.com/MetaCubeX/mihomo/releases"),
             "published_at": data.get("published_at", ""),
         }
     except Exception as exc:
@@ -760,7 +1161,7 @@ def make_handler(supervisor: WarpSupervisor, shutdown_cb):
                 self._send_json(200, st)
             elif self.path == "/api/transport":
                 mode = body.get("mode", "") if isinstance(body, dict) else ""
-                if mode not in ("auto", "http2", "quic"):
+                if mode not in VALID_MODES:
                     self._send_json(400, {"ok": False, "error": "Invalid mode"})
                     return
                 st = supervisor.set_transport_mode(mode)
@@ -769,8 +1170,8 @@ def make_handler(supervisor: WarpSupervisor, shutdown_cb):
                 supervisor.run_probe()
                 self._send_json(200, supervisor.get_status())
             elif self.path == "/api/check-usque-update":
-                res = check_usque_github_release()
-                res["current_version"] = supervisor.usque_version
+                res = check_engine_github_release()
+                res["current_version"] = supervisor.mihomo_version
                 self._send_json(200, res)
             elif self.path == "/api/stop":
                 self._send_json(200, {"ok": True, "stopping": True})
@@ -788,7 +1189,7 @@ def main() -> int:
     api_host = settings["api_host"]
     api_port = int(settings["api_port"])
 
-    # Single-instance check
+    # Single-instance guard
     try:
         with urllib.request.urlopen(f"http://{api_host}:{api_port}/api/status", timeout=1.5) as resp:
             if resp.status == 200:
@@ -823,7 +1224,7 @@ def main() -> int:
 
     server_holder["server"] = server
     log_line(
-        f"WARP Bridge v{BRIDGE_VERSION} listening: SOCKS5 {settings['socks_host']}:{settings['socks_port']} | API http://{api_host}:{api_port}"
+        f"PryWarp Bridge v{BRIDGE_VERSION} listening: SOCKS5 {settings['socks_host']}:{settings['socks_port']} | API http://{api_host}:{api_port}"
     )
     try:
         server.serve_forever(poll_interval=0.5)
