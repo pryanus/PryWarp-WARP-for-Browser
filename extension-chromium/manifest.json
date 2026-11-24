@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "PryWarp — WARP for Browser",
-  "version": "1.1.0",
+  "version": "1.1.1",
   "description": "Точечный обход YouTube и выбранных сайтов через локальный Cloudflare WARP SOCKS5 без влияния на остальной трафик.",
   "icons": {
     "16": "icons/icon-16.png",

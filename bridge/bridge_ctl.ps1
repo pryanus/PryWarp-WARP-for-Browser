@@ -104,7 +104,7 @@ function Start-Bridge {
 
     $online = $false
     $lastSt = $null
-    for ($i = 0; $i -lt 45; $i++) {
+    for ($i = 0; $i -lt 55; $i++) {
         Start-Sleep -Milliseconds 350
         $st = Get-BridgeStatus
         if ($st) {
@@ -121,7 +121,7 @@ function Start-Bridge {
     }
 
     if ($online) {
-        $tr = ($lastSt.transport).ToUpper()
+        $tr = if ($lastSt.transport -eq "awg") { "AmneziaWG" } else { ($lastSt.transport).ToUpper() }
         Write-Host "[PryWarp Bridge] Готово! WARP работает ($($lastSt.colo) / $tr / $($lastSt.latency_ms) мс)." -ForegroundColor Green
         Write-Host "[PryWarp Bridge] SOCKS5: 127.0.0.1:$($lastSt.socks_port) | Системный IP, DNS и игры не затронуты." -ForegroundColor Gray
         return $true

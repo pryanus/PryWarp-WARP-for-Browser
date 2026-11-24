@@ -46,13 +46,15 @@ WARP_CONFIG = BRIDGE_DIR / "config.json"
 SETTINGS_FILE = BRIDGE_DIR / "bridge_settings.json"
 LOG_FILE = BRIDGE_DIR / "bridge.log"
 
-BRIDGE_VERSION = "2.0.0"
+BRIDGE_VERSION = "2.0.1"
 
-# Verified high-speed Cloudflare WARP AmneziaWG (+i1) endpoints (EU ARN primary + RU DME backup)
+# Verified high-speed Cloudflare WARP AmneziaWG (+i1) endpoints across diverse subnets & ports
 AWG_ENDPOINTS: Tuple[Tuple[str, int], ...] = (
     ("162.159.192.1", 2408),
     ("188.114.96.1", 2408),
     ("188.114.97.1", 894),
+    ("162.159.192.8", 500),
+    ("188.114.96.3", 4500),
     ("188.114.99.224", 1002),
 )
 
@@ -68,10 +70,10 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
     "socks_port": 10880,
     "api_host": "127.0.0.1",
     "api_port": 10881,
-    "transport_mode": "auto",  # "auto" (AmneziaWG -> HTTP/2 fallback) | "awg" | "http2" | "quic"
+    "transport_mode": "auto",  # "auto" (strict AmneziaWG priority -> HTTP/2 only on full outage) | "awg" | "http2" | "quic"
     "probe_interval_sec": 45,
-    "failover_threshold": 3,
-    "recovery_retry_sec": 300,
+    "failover_threshold": 5,
+    "recovery_retry_sec": 180,
     "mtu": 1280,
     "dns_servers": ["1.1.1.1", "1.0.0.1"],
 }
@@ -120,6 +122,17 @@ def load_settings() -> Dict[str, Any]:
         data["mtu"] = max(1280, min(1420, mtu))
     except Exception:
         data["mtu"] = 1280
+    # Ensure legacy v1.0.x configs (failover_threshold=2) don't prematurely drop AmneziaWG
+    try:
+        if int(data.get("failover_threshold", 5)) < 5:
+            data["failover_threshold"] = 5
+    except Exception:
+        data["failover_threshold"] = 5
+    try:
+        if int(data.get("recovery_retry_sec", 180)) > 300:
+            data["recovery_retry_sec"] = 180
+    except Exception:
+        data["recovery_retry_sec"] = 180
     return data
 
 
@@ -184,8 +197,153 @@ def _generate_wg_keypair() -> Tuple[str, str]:
     return base64.b64encode(priv_b).decode("ascii"), base64.b64encode(pub_b).decode("ascii")
 
 
-def register_warp_awg_account() -> Optional[Dict[str, Any]]:
-    """Registers a free anonymous Cloudflare WARP WireGuard device via official API."""
+def _socks5_https_post_json(
+    socks_host: str,
+    socks_port: int,
+    target_host: str,
+    target_path: str,
+    body_bytes: bytes,
+    extra_headers: Dict[str, str],
+    timeout: float = 12.0,
+) -> Optional[Dict[str, Any]]:
+    raw_sock: Optional[socket.socket] = None
+    tls_sock: Optional[ssl.SSLSocket] = None
+    try:
+        raw_sock = socket.create_connection((socks_host, socks_port), timeout=timeout)
+        raw_sock.settimeout(timeout)
+        raw_sock.sendall(b"\x05\x01\x00")
+        if raw_sock.recv(2) != b"\x05\x00":
+            return None
+        hb = target_host.encode("ascii")
+        raw_sock.sendall(b"\x05\x01\x00\x03" + bytes([len(hb)]) + hb + struct.pack("!H", 443))
+        hdr = raw_sock.recv(4)
+        if len(hdr) != 4 or hdr[1] != 0:
+            return None
+        atyp = hdr[3]
+        if atyp == 1:
+            raw_sock.recv(6)
+        elif atyp == 3:
+            raw_sock.recv(raw_sock.recv(1)[0] + 2)
+        elif atyp == 4:
+            raw_sock.recv(18)
+
+        ctx = ssl.create_default_context()
+        tls_sock = ctx.wrap_socket(raw_sock, server_hostname=target_host)
+        tls_sock.settimeout(timeout)
+
+        hdr_lines = [
+            f"POST {target_path} HTTP/1.1",
+            f"Host: {target_host}",
+            f"Content-Length: {len(body_bytes)}",
+            "Connection: close",
+        ]
+        for k, v in extra_headers.items():
+            hdr_lines.append(f"{k}: {v}")
+        req_bytes = ("\r\n".join(hdr_lines) + "\r\n\r\n").encode("ascii") + body_bytes
+        tls_sock.sendall(req_bytes)
+
+        chunks = []
+        while True:
+            c = tls_sock.recv(4096)
+            if not c:
+                break
+            chunks.append(c)
+        text = b"".join(chunks).decode("utf-8", errors="replace")
+        head, _, body = text.partition("\r\n\r\n")
+        if " 200 " not in head.splitlines()[0]:
+            return None
+        # Handle chunked transfer encoding if present
+        if "transfer-encoding: chunked" in head.lower():
+            decoded = []
+            idx = 0
+            while idx < len(body):
+                nl = body.find("\r\n", idx)
+                if nl == -1:
+                    break
+                sz = int(body[idx:nl].split(";")[0].strip(), 16)
+                if sz == 0:
+                    break
+                decoded.append(body[nl + 2 : nl + 2 + sz])
+                idx = nl + 2 + sz + 2
+            body = "".join(decoded)
+        return json.loads(body)
+    except Exception as exc:
+        log_line(f"SOCKS5 WARP reg attempt failed: {exc}")
+        return None
+    finally:
+        for s in (tls_sock, raw_sock):
+            if s is not None:
+                try:
+                    s.close()
+                except Exception:
+                    pass
+
+
+def _register_awg_via_temp_usque(
+    payload: bytes,
+    headers: Dict[str, str],
+    base_socks_port: int,
+) -> Optional[Dict[str, Any]]:
+    """Bootstrap fallback: if ISP/zapret blocks api.cloudflareclient.com directly, register through temp usque HTTP/2."""
+    if not USQUE_EXE.exists():
+        return None
+    log_line("Direct WARP API blocked — bootstrapping AmneziaWG key via temporary usque HTTP/2...")
+    if not (WARP_CONFIG.exists() and WARP_CONFIG.stat().st_size > 100):
+        try:
+            subprocess.run(
+                [str(USQUE_EXE), "-c", str(WARP_CONFIG), "register", "-a"],
+                capture_output=True,
+                text=True,
+                timeout=15,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+        except Exception:
+            return None
+    if not WARP_CONFIG.exists():
+        return None
+    _set_usque_config_endpoint(HTTP2_ENDPOINT)
+    temp_port = min(65000, base_socks_port + 99)
+    proc = subprocess.Popen(
+        [
+            str(USQUE_EXE),
+            "-c",
+            str(WARP_CONFIG),
+            "socks",
+            "--http2",
+            "-b",
+            "127.0.0.1",
+            "-p",
+            str(temp_port),
+            "-m",
+            "1280",
+            "-d",
+            "1.1.1.1",
+        ],
+        cwd=str(BRIDGE_DIR),
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+    )
+    try:
+        if not _wait_socks_port("127.0.0.1", temp_port, timeout=4.0):
+            return None
+        time.sleep(0.5)
+        return _socks5_https_post_json(
+            "127.0.0.1", temp_port, "api.cloudflareclient.com", "/v0a2158/reg", payload, headers, timeout=12.0
+        )
+    finally:
+        try:
+            proc.terminate()
+            proc.wait(timeout=2)
+        except Exception:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+
+
+def register_warp_awg_account(base_socks_port: int = 10880) -> Optional[Dict[str, Any]]:
+    """Registers a free anonymous Cloudflare WARP WireGuard device via official API (direct or via temp HTTP/2)."""
     priv_b64, pub_b64 = _generate_wg_keypair()
     now_iso = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
     payload = json.dumps(
@@ -206,8 +364,9 @@ def register_warp_awg_account() -> Optional[Dict[str, Any]]:
         "CF-Client-Version": "a-6.10-2158",
     }
 
+    data: Optional[Dict[str, Any]] = None
     last_err = ""
-    for attempt in range(2):
+    for _attempt in range(2):
         try:
             req = urllib.request.Request(
                 "https://api.cloudflareclient.com/v0a2158/reg",
@@ -215,35 +374,45 @@ def register_warp_awg_account() -> Optional[Dict[str, Any]]:
                 headers=headers,
                 method="POST",
             )
-            with urllib.request.urlopen(req, timeout=10) as resp:
+            with urllib.request.urlopen(req, timeout=8) as resp:
                 data = json.loads(resp.read().decode("utf-8"))
-            cfg = data["config"]
-            client_id = str(cfg.get("client_id", ""))
-            reserved = list(base64.b64decode(client_id)[:3]) if client_id else [0, 0, 0]
-            account = {
-                "device_id": data.get("id", ""),
-                "private_key": priv_b64,
-                "public_key": pub_b64,
-                "peer_public_key": cfg["peers"][0]["public_key"],
-                "ip4": cfg["interface"]["addresses"]["v4"],
-                "ip6": cfg["interface"]["addresses"]["v6"],
-                "reserved": reserved,
-                "created_at": now_iso,
-            }
-            tmp = AWG_CONFIG.with_suffix(".json.tmp")
-            tmp.write_text(json.dumps(account, indent=2), encoding="utf-8")
-            tmp.replace(AWG_CONFIG)
-            log_line("Free Cloudflare WARP (AmneziaWG) key registered cleanly.")
-            return account
+            break
         except Exception as exc:
             last_err = str(exc)
-            time.sleep(0.8)
+            time.sleep(0.6)
 
-    log_line(f"WARP AmneziaWG registration failed: {last_err}")
-    return None
+    if data is None:
+        data = _register_awg_via_temp_usque(payload, headers, base_socks_port)
+
+    if not data or "config" not in data:
+        log_line(f"WARP AmneziaWG registration failed: {last_err or 'no response'}")
+        return None
+
+    try:
+        cfg = data["config"]
+        client_id = str(cfg.get("client_id", ""))
+        reserved = list(base64.b64decode(client_id)[:3]) if client_id else [0, 0, 0]
+        account = {
+            "device_id": data.get("id", ""),
+            "private_key": priv_b64,
+            "public_key": pub_b64,
+            "peer_public_key": cfg["peers"][0]["public_key"],
+            "ip4": cfg["interface"]["addresses"]["v4"],
+            "ip6": cfg["interface"]["addresses"]["v6"],
+            "reserved": reserved,
+            "created_at": now_iso,
+        }
+        tmp = AWG_CONFIG.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(account, indent=2), encoding="utf-8")
+        tmp.replace(AWG_CONFIG)
+        log_line("Free Cloudflare WARP (AmneziaWG) key registered cleanly.")
+        return account
+    except Exception as exc:
+        log_line(f"WARP AmneziaWG registration parse failed: {exc}")
+        return None
 
 
-def load_or_create_awg_account() -> Optional[Dict[str, Any]]:
+def load_or_create_awg_account(base_socks_port: int = 10880) -> Optional[Dict[str, Any]]:
     if AWG_CONFIG.exists():
         try:
             data = json.loads(AWG_CONFIG.read_text(encoding="utf-8-sig"))
@@ -251,7 +420,7 @@ def load_or_create_awg_account() -> Optional[Dict[str, Any]]:
                 return data
         except Exception as exc:
             log_line(f"warp_awg.json read warning: {exc}")
-    return register_warp_awg_account()
+    return register_warp_awg_account(base_socks_port=base_socks_port)
 
 
 def write_mihomo_runtime_yaml(
@@ -320,6 +489,8 @@ def write_mihomo_runtime_yaml(
         f"    type: url-test\n"
         f'    url: "https://www.cloudflare.com/cdn-cgi/trace"\n'
         f"    interval: 90\n"
+        f"    timeout: 3000\n"
+        f"    max-failed-times: 1\n"
         f"    tolerance: 80\n"
         f"    lazy: false\n"
         f"    proxies:\n"
@@ -552,7 +723,7 @@ class WarpSupervisor:
         self.proc_gen: int = 0
         self.proc_started_at: float = 0.0
         self.cold_start_pending: bool = False
-        self.cold_warmup_missed: bool = False
+        self.cold_warmup_misses: int = 0
         self.fallback_since: Optional[float] = None
         self.recovery_backoff_mult: int = 1
         self.masque_connected_event = threading.Event()
@@ -688,7 +859,7 @@ class WarpSupervisor:
                 log_line(self.last_error)
                 return False
 
-            account = load_or_create_awg_account()
+            account = load_or_create_awg_account(base_socks_port=socks_port)
             if not account:
                 if self.settings.get("transport_mode", "auto") == "auto" and USQUE_EXE.exists():
                     log_line("AmneziaWG registration unavailable — falling back to usque HTTP/2")
@@ -775,7 +946,7 @@ class WarpSupervisor:
             self.active_engine = engine
             self.proc_started_at = time.time()
             self.cold_start_pending = True
-            self.cold_warmup_missed = False
+            self.cold_warmup_misses = 0
             self.state = "connecting"
             self.warp_status = "off"
             self.colo = ""
@@ -811,8 +982,9 @@ class WarpSupervisor:
             socks_port = int(self.settings["socks_port"])
             engine = self.active_engine
         if engine == "mihomo":
-            _wait_socks_port(socks_host, socks_port, timeout=3.0)
-            time.sleep(0.15)
+            _wait_socks_port(socks_host, socks_port, timeout=4.0)
+            # Give mihomo url-test a short head start to pick the best live endpoint
+            time.sleep(0.85)
         else:
             if not self.socks_listening_event.wait(timeout=2.5):
                 _wait_socks_port(socks_host, socks_port, timeout=1.5)
@@ -881,7 +1053,7 @@ class WarpSupervisor:
                 self.last_error = f"Процесс {self.active_engine} остановился, перезапуск..."
             return False
 
-        probe_timeout = 7.0 if cold else 6.0
+        probe_timeout = 10.0 if cold else 6.5
         ok, info = socks5_cloudflare_and_youtube_probe(socks_host, socks_port, timeout=probe_timeout)
         now = time.time()
         with self.lock:
@@ -899,17 +1071,21 @@ class WarpSupervisor:
                 self.last_error = ""
                 self.consecutive_failures = 0
                 self.cold_start_pending = False
-                self.cold_warmup_missed = False
+                self.cold_warmup_misses = 0
                 if self.active_transport == "awg":
                     self.fallback_since = None
                     self.recovery_backoff_mult = 1
                 return True
             else:
-                if self.cold_start_pending and not self.cold_warmup_missed and (now - self.proc_started_at) < 16.0:
-                    self.cold_warmup_missed = True
+                # Give AmneziaWG url-test up to 2 warm-up passes (~25s) before ever counting failures
+                max_warmups = 2 if self.active_transport == "awg" else 1
+                if self.cold_start_pending and self.cold_warmup_misses < max_warmups and (now - self.proc_started_at) < 25.0:
+                    self.cold_warmup_misses += 1
                     self.state = "connecting"
                     self.last_error = info.get("error", "Прогрев туннеля...")
-                    log_line(f"Cold-start warm-up probe on {self.active_transport}: {self.last_error}")
+                    log_line(
+                        f"Cold-start warm-up probe {self.cold_warmup_misses}/{max_warmups} on {self.active_transport}: {self.last_error}"
+                    )
                     return False
 
                 self.cold_start_pending = False
@@ -937,8 +1113,8 @@ class WarpSupervisor:
                 with self.lock:
                     proc_dead = self.proc is None or self.proc.poll() is not None
                     probe_interval = max(10, int(self.settings.get("probe_interval_sec", 45)))
-                    failover_threshold = max(2, int(self.settings.get("failover_threshold", 3)))
-                    recovery_retry = max(60, int(self.settings.get("recovery_retry_sec", 300)))
+                    failover_threshold = max(3, int(self.settings.get("failover_threshold", 5)))
+                    recovery_retry = max(60, int(self.settings.get("recovery_retry_sec", 180)))
                     mode = self.settings.get("transport_mode", "auto")
 
                 if proc_dead:
@@ -977,17 +1153,19 @@ class WarpSupervisor:
                         need_wait_ready = False
                         with self.lock:
                             failures = self.consecutive_failures
-                            # Priority to AmneziaWG: on failure #2 try restarting mihomo on the next endpoint first;
-                            # only fall back to HTTP/2 on full outage (>= failover_threshold, default 3).
+                            # Strict priority to AmneziaWG: rotate & restart AmneziaWG on failure #2 and #4;
+                            # only fall back to HTTP/2 on full sustained outage (>= failover_threshold, default 5).
                             if (
                                 mode == "auto"
                                 and self.active_transport == "awg"
-                                and failures == failover_threshold - 1
-                                and failures >= 2
+                                and failures in (2, 4)
+                                and failures < failover_threshold
                             ):
                                 self.awg_endpoint_idx = (self.awg_endpoint_idx + 1) % len(AWG_ENDPOINTS)
                                 self.restarts += 1
-                                log_line("AmneziaWG soft-retry: rotating endpoint before any HTTP/2 fallback")
+                                log_line(
+                                    f"AmneziaWG soft-retry ({failures}/{failover_threshold}): rotating endpoint before any HTTP/2 fallback"
+                                )
                                 self._start_proc_locked("awg")
                                 need_wait_ready = True
                             elif failures >= failover_threshold:
