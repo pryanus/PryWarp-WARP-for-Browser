@@ -18,4 +18,5 @@ __pycache__/
 build/
 build_payload/
 dist/
+store-release/
 *.spec
