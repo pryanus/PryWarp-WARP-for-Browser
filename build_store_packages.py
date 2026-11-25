@@ -38,8 +38,8 @@ HTML_REPLACEMENTS = [
     ('<h2 class="section-title">Туннель Cloudflare WARP</h2>', '<h2 class="section-title">Локальный прокси-мост</h2>'),
     ("PryWarp — WARP for Browser · v", "PryWarp — Local Proxy Router · v"),
     # Hide GitHub self-updater tab in store builds (stores manage updates themselves)
-    ('<button id="tabUpdates" class="tab-btn" role="tab" aria-selected="false" type="button">Обновление</button>',
-     '<button id="tabUpdates" class="tab-btn" role="tab" aria-selected="false" type="button" hidden>Обновление</button>'),
+    ('<button id="tabUpdates" class="tab-pill" type="button" role="tab" aria-selected="false" aria-controls="panelUpdates">',
+     '<button id="tabUpdates" class="tab-pill" type="button" role="tab" aria-selected="false" aria-controls="panelUpdates" hidden>'),
 ]
 
 JS_POPUP_REPLACEMENTS = [
